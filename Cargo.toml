@@ -2,10 +2,24 @@
 name = "void-bootstrap-node"
 version = "0.1.0"
 edition = "2021"
-description = "Bootstrap / seed node for VOID P2P messenger DHT"
+description = "Bootstrap / seed / relay node for VOID P2P messenger DHT"
 
 [dependencies]
-libp2p = { version = "0.56", features = ["tcp", "noise", "yamux", "tokio", "kad", "ping", "macros"] }
+libp2p = { version = "0.56", features = [
+    "tcp",
+    "quic",
+    "dns",
+    "noise",
+    "yamux",
+    "tokio",
+    "kad",
+    "ping",
+    "identify",
+    "relay",
+    "autonat",
+    "macros",
+    "ed25519",
+] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
 futures = "0.3"
 tracing = "0.1"
