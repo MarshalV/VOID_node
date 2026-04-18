@@ -168,8 +168,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     let web_state = app_state.clone();
+    let web_bind_for_task = web_bind.clone();
     let web_task = tokio::spawn(async move {
-        if let Err(e) = web::run(web_state, web_bind).await {
+        if let Err(e) = web::run(web_state, web_bind_for_task).await {
             tracing::error!(?e, "web UI exited");
         }
     });
@@ -180,8 +181,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("libp2p port:  {}  (env LISTEN_PORT)", libp2p_port);
     println!("seed  port:   {}  (env SEED_PORT)", seed_port);
     println!(
-        "web UI:       http://{}   (env WEB_BIND; only localhost by default)",
-        std::env::var("WEB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string())
+        "web UI:       preferred {}  (env WEB_BIND; actual URL printed below when bound)",
+        web_bind
     );
     println!();
     println!("Multiaddr templates for VOID clients:");

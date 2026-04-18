@@ -16,6 +16,7 @@
 //   POST /api/connect       -> contact a remote seed, verify, exchange
 //   GET  /api/activity      -> recent events
 
+use anyhow::{anyhow, Context};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -34,6 +35,10 @@ const INDEX_HTML: &str = include_str!("../static/index.html");
 const APP_CSS: &str = include_str!("../static/style.css");
 const APP_JS: &str = include_str!("../static/app.js");
 
+/// How many consecutive ports to try if the preferred one is busy,
+/// before falling back to an OS-assigned ephemeral port.
+const PORT_FALLBACK_WINDOW: u16 = 20;
+
 pub async fn run(state: Arc<AppState>, bind: String) -> anyhow::Result<()> {
     let app = Router::new()
         .route("/", get(index))
@@ -45,13 +50,74 @@ pub async fn run(state: Arc<AppState>, bind: String) -> anyhow::Result<()> {
         .route("/api/nodes/:pid", delete(api_remove_node))
         .route("/api/connect", post(api_connect))
         .route("/api/activity", get(api_activity))
-        .with_state(state);
+        .with_state(state.clone());
 
-    let addr: SocketAddr = bind.parse()?;
-    let listener = TcpListener::bind(addr).await?;
-    tracing::info!(%addr, "web UI listening");
+    let pref: SocketAddr = bind.parse().with_context(|| format!("bad WEB_BIND {bind:?}"))?;
+    let (listener, actual) = bind_with_fallback(pref).await?;
+
+    if actual.port() != pref.port() {
+        let msg = format!(
+            "requested port {} is busy, switched to {}",
+            pref.port(),
+            actual.port()
+        );
+        tracing::warn!("{msg}");
+        state.log("web", msg).await;
+    }
+
+    tracing::info!(%actual, "web UI listening");
+    println!();
+    println!(">>> Web UI:  http://{}/", display_addr(&actual));
+    println!();
+
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+async fn bind_with_fallback(pref: SocketAddr) -> anyhow::Result<(TcpListener, SocketAddr)> {
+    let mut last_err: Option<std::io::Error> = None;
+
+    let mut candidates: Vec<u16> = Vec::new();
+    if pref.port() != 0 {
+        candidates.push(pref.port());
+        for delta in 1..=PORT_FALLBACK_WINDOW {
+            if let Some(p) = pref.port().checked_add(delta) {
+                candidates.push(p);
+            }
+        }
+    }
+    candidates.push(0);
+
+    for port in candidates {
+        let addr = SocketAddr::new(pref.ip(), port);
+        match TcpListener::bind(addr).await {
+            Ok(listener) => {
+                let actual = listener.local_addr().unwrap_or(addr);
+                return Ok((listener, actual));
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                last_err = Some(e);
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    Err(anyhow!(
+        "cannot bind web UI on any port near {}: {:?}",
+        pref,
+        last_err
+    ))
+}
+
+fn display_addr(a: &SocketAddr) -> String {
+    // Make localhost look friendlier in the browser bar.
+    let ip = a.ip();
+    if ip.is_unspecified() {
+        format!("127.0.0.1:{}", a.port())
+    } else {
+        a.to_string()
+    }
 }
 
 async fn index() -> Html<&'static str> {
