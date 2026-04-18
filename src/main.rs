@@ -1,45 +1,46 @@
-//! VOID bootstrap / seed / relay node + DNS-Seed web UI.
+//! VOID bootstrap / seed / relay node.
 //!
-//! This binary runs three things concurrently:
-//!   1. libp2p swarm (same "/void/v1" + "/void/kad/1.0.0" as before),
-//!      so existing VOID clients keep bootstrapping through us;
-//!   2. a dedicated encrypted seed-exchange TCP listener
-//!      (`/void-seed/v1`) on SEED_PORT (default 4010), used to share
-//!      known-peer lists between seed-servers. Nothing is transmitted
-//!      in plaintext; every message after the initial 32-byte random-
-//!      looking ephemeral X25519 key is ChaCha20-Poly1305-encrypted
-//!      and authenticated with Ed25519 signatures of both sides.
-//!   3. a local-only web UI (127.0.0.1:WEB_PORT, default 8080) used by
-//!      the operator to inspect status, to paste another seed's
-//!      "ip:port" and trigger an encrypted exchange.
+//! At startup the node:
+//!   1. asks the operator (via stdin) for the IP[:port] of another VOID
+//!      seed to join. Empty input means "standalone" -- the node still
+//!      runs as a libp2p bootstrap + a VOID-SEED/v1 server, but it does
+//!      not try to fetch peers from anyone;
+//!   2. if an address is given, performs the encrypted VOID-SEED/v1
+//!      handshake (Noise-XX-like, X25519+ChaCha20-Poly1305+Ed25519,
+//!      Perfect Forward Secrecy, mutual auth) with the remote, swaps
+//!      peer lists, stores them in known_nodes.json and seeds the
+//!      libp2p Kademlia routing table with their multiaddrs;
+//!   3. starts the libp2p swarm (TCP/UDP-QUIC on LISTEN_PORT) and the
+//!      VOID-SEED/v1 listener (TCP on SEED_PORT) so other nodes can
+//!      bootstrap from us in turn.
 
 mod seed_protocol;
 mod seed_server;
 mod seed_client;
 mod state;
 mod storage;
-mod web;
 
 use futures::StreamExt;
 use libp2p::{
     autonat, identify, identity, kad, noise, ping, relay,
     swarm::{NetworkBehaviour, SwarmEvent},
-    tcp, yamux, Multiaddr, StreamProtocol,
+    tcp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
 use std::error::Error;
 use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
-use tokio::sync::RwLock;
 
+use crate::seed_protocol::SeedEntry;
 use crate::state::AppState;
 use crate::storage::NodesStore;
 
 const IDENTITY_FILE: &str = "bootstrap_peer.key";
 const NODES_FILE: &str = "known_nodes.json";
 const IDENTIFY_PROTOCOL_VERSION: &str = "/void/v1";
-const IDENTIFY_AGENT_VERSION: &str = "void-bootstrap-node/0.2";
+const IDENTIFY_AGENT_VERSION: &str = "void-bootstrap-node/0.3";
 
 fn load_or_create_keypair(path: &Path) -> Result<identity::Keypair, Box<dyn Error + Send + Sync>> {
     if path.exists() {
@@ -67,6 +68,61 @@ struct BootBehaviour {
     ping: ping::Behaviour,
 }
 
+/// Reads one line from stdin without blocking the tokio runtime.
+async fn prompt_line(question: &str) -> String {
+    let q = question.to_string();
+    tokio::task::spawn_blocking(move || {
+        use std::io::{self, BufRead, Write};
+        print!("{q}");
+        io::stdout().flush().ok();
+        let mut line = String::new();
+        let _ = io::stdin().lock().read_line(&mut line);
+        line.trim().to_string()
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn split_host_port(raw: &str, default_port: u16) -> (String, u16) {
+    let s = raw.trim();
+    if let Some(rest) = s.strip_prefix('[') {
+        if let Some((h, p)) = rest.split_once("]:") {
+            if let Ok(port) = p.parse::<u16>() {
+                return (h.to_string(), port);
+            }
+        }
+        if let Some(h) = rest.strip_suffix(']') {
+            return (h.to_string(), default_port);
+        }
+    }
+    if s.matches(':').count() == 1 {
+        if let Some((h, p)) = s.split_once(':') {
+            if let Ok(port) = p.parse::<u16>() {
+                return (h.to_string(), port);
+            }
+        }
+    }
+    (s.to_string(), default_port)
+}
+
+/// Convert a SeedEntry into a libp2p Multiaddr (TCP-based) suitable for `dial()`.
+fn entry_to_multiaddr(e: &SeedEntry) -> Option<(PeerId, Multiaddr)> {
+    if e.libp2p_port == 0 || e.peer_id_b58.is_empty() || e.host.is_empty() {
+        return None;
+    }
+    let pid = PeerId::from_str(&e.peer_id_b58).ok()?;
+    let host_part = if e.host.parse::<std::net::Ipv4Addr>().is_ok() {
+        format!("/ip4/{}", e.host)
+    } else if e.host.parse::<std::net::Ipv6Addr>().is_ok() {
+        format!("/ip6/{}", e.host)
+    } else {
+        format!("/dns4/{}", e.host)
+    };
+    let addr_str = format!("{host_part}/tcp/{}/p2p/{}", e.libp2p_port, pid);
+    let addr: Multiaddr = addr_str.parse().ok()?;
+    Some((pid, addr))
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
@@ -87,27 +143,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4010);
-    let web_bind: String =
-        std::env::var("WEB_BIND").unwrap_or_else(|_| "127.0.0.1:8080".to_string());
     let seed_bind: String =
         std::env::var("SEED_BIND").unwrap_or_else(|_| format!("0.0.0.0:{seed_port}"));
+    let public_host: String = std::env::var("PUBLIC_HOST").unwrap_or_default();
 
     let store = NodesStore::load(NODES_FILE).await?;
-    let started_at = state::now_secs();
     let app_state = Arc::new(AppState {
         keypair: keypair.clone(),
         my_peer_id_b58: local_peer_id.to_base58(),
         store,
         libp2p_port,
         seed_port,
-        started_at,
-        public_host: Arc::new(RwLock::new(String::new())),
-        activity: Arc::new(RwLock::new(Vec::new())),
+        public_host,
     });
 
-    app_state
-        .log("start", format!("node started, peer_id={}", app_state.my_peer_id_b58))
-        .await;
+    println!();
+    println!("=== VOID bootstrap (seed + relay + DNS-Seed) ===");
+    println!("PeerId:       {}", local_peer_id);
+    println!("libp2p port:  {} (env LISTEN_PORT)", libp2p_port);
+    println!("seed  port:   {} (env SEED_PORT)", seed_port);
+    if !app_state.public_host.is_empty() {
+        println!("public host:  {} (env PUBLIC_HOST)", app_state.public_host);
+    }
+    println!("known nodes:  {} (loaded from {NODES_FILE})", app_state.store.len().await);
+    println!();
+
+    // ---------- ask the operator for an entry-point ----------
+    let question = format!(
+        "Введите IP[:port] другой VOID-ноды для подключения к сети\n  \
+         (Enter -- работать как изолированная сеть; порт по умолчанию {seed_port}): "
+    );
+    let answer = prompt_line(&question).await;
+    println!();
 
     // ---------- libp2p swarm ----------
     let mut swarm = libp2p::SwarmBuilder::with_existing_identity(keypair)
@@ -159,7 +226,70 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         tracing::warn!("QUIC failed on {}: {:?}", libp2p_port, e);
     }
 
-    // ---------- spawn seed server + web UI ----------
+    // ---------- seed exchange (encrypted) ----------
+    if answer.is_empty() {
+        println!(">>> Режим: ИЗОЛИРОВАННАЯ сеть (никого не запрашиваем).");
+        println!(">>> Другие ноды смогут подключаться к нам по seed-порту {seed_port}.");
+    } else {
+        let (host, port) = split_host_port(&answer, seed_port);
+        println!(">>> Подключаемся к {host}:{port} (зашифрованный handshake VOID-SEED/v1)...");
+        match seed_client::contact(app_state.clone(), &host, port).await {
+            Ok(rep) => {
+                println!(">>> УСПЕХ. Удалённый узел подтвердил принадлежность к VOID.");
+                println!("    PeerId : {}", rep.peer_id_b58);
+                println!("    Agent  : {}", rep.agent);
+                println!("    Передано наших : {}", rep.sent);
+                println!("    Получено пиров : {}", rep.received);
+                println!("    Новых добавлено: {}", rep.added);
+
+                // Seed Kademlia with received peers and dial them.
+                let mut dialed = 0usize;
+                for entry in &rep.peers {
+                    if let Some((pid, addr)) = entry_to_multiaddr(entry) {
+                        if pid == local_peer_id {
+                            continue;
+                        }
+                        swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                        if let Err(e) = swarm.dial(addr.clone()) {
+                            tracing::debug!(?e, %addr, "dial skipped");
+                        } else {
+                            dialed += 1;
+                        }
+                    }
+                }
+                if dialed > 0 {
+                    println!("    Стартовый dial: {dialed} адр.");
+                    let _ = swarm.behaviour_mut().kad.bootstrap();
+                }
+            }
+            Err(e) => {
+                eprintln!(">>> ОШИБКА подключения: {e:#}");
+                eprintln!(">>> Стартую как изолированная сеть -- другие смогут подключиться к нам.");
+            }
+        }
+    }
+
+    // Even in standalone mode we dial peers we already knew from previous runs.
+    {
+        let known = app_state.store.all().await;
+        let mut dialed = 0usize;
+        for entry in &known {
+            if let Some((pid, addr)) = entry_to_multiaddr(entry) {
+                if pid == local_peer_id {
+                    continue;
+                }
+                swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                if swarm.dial(addr.clone()).is_ok() {
+                    dialed += 1;
+                }
+            }
+        }
+        if dialed > 0 {
+            tracing::info!(dialed, "dialed cached peers from {NODES_FILE}");
+        }
+    }
+
+    // ---------- spawn the seed listener ----------
     let seed_state = app_state.clone();
     let seed_task = tokio::spawn(async move {
         if let Err(e) = seed_server::run(seed_state, seed_bind).await {
@@ -167,31 +297,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         }
     });
 
-    let web_state = app_state.clone();
-    let web_bind_for_task = web_bind.clone();
-    let web_task = tokio::spawn(async move {
-        if let Err(e) = web::run(web_state, web_bind_for_task).await {
-            tracing::error!(?e, "web UI exited");
-        }
-    });
-
-    println!();
-    println!("=== VOID bootstrap (seed + relay + DNS-Seed) ===");
-    println!("PeerId:       {}", local_peer_id);
-    println!("libp2p port:  {}  (env LISTEN_PORT)", libp2p_port);
-    println!("seed  port:   {}  (env SEED_PORT)", seed_port);
-    println!(
-        "web UI:       preferred {}  (env WEB_BIND; actual URL printed below when bound)",
-        web_bind
-    );
     println!();
     println!("Multiaddr templates for VOID clients:");
     println!("  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{}", libp2p_port, local_peer_id);
     println!("  /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{}", libp2p_port, local_peer_id);
     println!();
-    println!("To share this node with other seed operators, tell them to paste");
-    println!("  <PUBLIC_IP>:{}   into the web UI of their node.", seed_port);
-    println!("Ctrl+C to stop.");
+    println!("Чтобы другая нода присоединилась через нас, передайте им:");
+    println!(
+        "  {}:{}",
+        if app_state.public_host.is_empty() { "<ВАШ_ПУБЛИЧНЫЙ_IP>" } else { app_state.public_host.as_str() },
+        seed_port
+    );
+    println!("Ctrl+C -- остановка.");
     println!();
 
     loop {
@@ -238,6 +355,5 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     }
 
     seed_task.abort();
-    web_task.abort();
     Ok(())
 }

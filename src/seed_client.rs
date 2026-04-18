@@ -1,9 +1,11 @@
 // Client side of the VOID-SEED/v1 protocol.
 //
-// Used by the web UI when an operator pastes "ip:port" of another
-// VOID node / DNS-Seed server and asks us to verify and exchange
-// lists. The whole flow is: DNS-resolve -> TCP connect -> encrypted
-// handshake (mutual Ed25519 auth, PFS) -> exchange -> merge.
+// Used at startup when the operator pastes "ip:port" of another VOID
+// seed and asks us to join the network. Steps:
+//   1. resolve + TCP connect
+//   2. encrypted Noise-XX-like handshake (mutual Ed25519 auth, PFS)
+//   3. swap "offer" lists; we always advertise ourselves first
+//   4. merge received peers into our local store
 
 use anyhow::{anyhow, Context, Result};
 use std::sync::Arc;
@@ -24,14 +26,11 @@ pub struct ContactReport {
     pub added: usize,
     pub received: usize,
     pub sent: usize,
+    /// All peers received from the remote side, plus the remote itself.
+    pub peers: Vec<SeedEntry>,
 }
 
-pub async fn contact(
-    state: Arc<AppState>,
-    host: &str,
-    port: u16,
-    public_host: &str,
-) -> Result<ContactReport> {
+pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<ContactReport> {
     let addr = format!("{host}:{port}");
     let sock = timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
         .await
@@ -40,10 +39,10 @@ pub async fn contact(
     let _ = sock.set_nodelay(true);
     let mut stream = BufStream::new(sock);
 
-    // Build our offer: we always advertise ourselves first, then fresh peers.
+    // Build our offer: advertise ourselves first, then any fresh peers we know.
     let mut offer: Vec<SeedEntry> = state.store.all().await;
     offer.truncate(128);
-    offer.insert(0, crate::seed_server::build_self_entry(&state, public_host));
+    offer.insert(0, crate::seed_server::build_self_entry(&state, &state.public_host));
     let sent = offer.len();
 
     let request = SeedRequest::Exchange { offer, want_max: 256 };
@@ -54,7 +53,7 @@ pub async fn contact(
     .await
     .with_context(|| format!("handshake timeout to {addr}"))??;
 
-    let peers = match res.response {
+    let mut peers = match res.response {
         SeedResponse::Peers { peers } => peers,
         SeedResponse::Error { message } => {
             return Err(anyhow!("remote rejected: {message}"));
@@ -63,13 +62,25 @@ pub async fn contact(
 
     let received = peers.len();
 
-    // Remember the seed we just talked to.
-    state
-        .store
-        .touch(&res.peer_id_b58, host, port, 0)
-        .await;
+    // Remember the seed we just talked to (use the host the operator typed).
+    state.store.touch(&res.peer_id_b58, host, port, 0).await;
 
-    let (added, _total) = state.store.merge(peers, &state.my_peer_id_b58).await;
+    // Make sure the contacted seed is included in `peers` so callers can dial
+    // it via libp2p too.
+    peers.push(SeedEntry {
+        host: host.to_string(),
+        seed_port: port,
+        libp2p_port: res
+            .peer_auth
+            .libp2p_pubkey_proto
+            .first()
+            .map(|_| 0)
+            .unwrap_or(0), // unknown; libp2p_port is filled later from identify
+        peer_id_b58: res.peer_id_b58.clone(),
+        last_seen: crate::state::now_secs(),
+    });
+
+    let (added, _total) = state.store.merge(peers.clone(), &state.my_peer_id_b58).await;
 
     Ok(ContactReport {
         peer_id_b58: res.peer_id_b58,
@@ -77,5 +88,6 @@ pub async fn contact(
         added,
         received,
         sent,
+        peers,
     })
 }

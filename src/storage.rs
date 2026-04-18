@@ -123,6 +123,7 @@ impl NodesStore {
         let _ = self.persist().await;
     }
 
+    #[allow(dead_code)]
     pub async fn remove(&self, peer_id_b58: &str) -> bool {
         let removed = {
             let mut g = self.inner.write().await;
