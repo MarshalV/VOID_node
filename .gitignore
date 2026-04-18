@@ -1,2 +1,5 @@
 /target/
 bootstrap_peer.key
+known_nodes.json
+cargo_check.log
+cargo_build.log

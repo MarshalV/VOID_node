@@ -1,8 +1,8 @@
 [package]
 name = "void-bootstrap-node"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
-description = "Bootstrap / seed / relay node for VOID P2P messenger DHT"
+description = "Bootstrap / seed / relay node for VOID P2P messenger DHT + encrypted DNS-Seed exchange"
 
 [dependencies]
 libp2p = { version = "0.56", features = [
@@ -20,10 +20,37 @@ libp2p = { version = "0.56", features = [
     "macros",
     "ed25519",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "sync", "time", "fs"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# --- web UI ---
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+mime_guess = "2"
+
+# --- serialization ---
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bincode = "1.3"
+
+# --- crypto: Noise-XX-подобный handshake для seed-протокола ---
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+chacha20poly1305 = "0.10"
+sha2 = "0.10"
+hkdf = "0.12"
+rand = "0.8"
+zeroize = { version = "1.7", features = ["derive"] }
+
+# --- utils ---
+anyhow = "1"
+thiserror = "1"
+bs58 = "0.5"
+hex = "0.4"
+time = { version = "0.3", features = ["formatting", "macros"] }
 
 [profile.release]
 strip = true
