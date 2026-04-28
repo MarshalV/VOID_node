@@ -45,7 +45,8 @@ use zeroize::Zeroize;
 
 pub const PROTOCOL_VERSION: &str = "/void-seed/v1";
 pub const VOID_IDENTIFY_VERSION: &str = "/void/v1";
-pub const AGENT_VERSION: &str = "void-bootstrap-node/0.2";
+/// Agent version строка в seed-протоколе. Должна совпадать с IDENTIFY_AGENT_VERSION в main.rs.
+pub const AGENT_VERSION: &str = "void-bootstrap-node/0.3";
 
 /// Hard cap on a single wire frame (DoS guard).
 pub const MAX_FRAME: usize = 1024 * 1024;

@@ -208,15 +208,28 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let relay = relay::Behaviour::new(pid, relay::Config::default());
             let autonat = autonat::Behaviour::new(pid, autonat::Config::default());
 
+            // Ping: интервал 20 с, таймаут 40 с.
+            // Default (interval=15, timeout=20) слишком агрессивен для
+            // нагруженных сетей — увеличиваем таймаут до 40 с, чтобы
+            // кратковременные потери пакетов не разрывали соединения с клиентами.
+            let ping = ping::Behaviour::new(
+                ping::Config::new()
+                    .with_interval(Duration::from_secs(20))
+                    .with_timeout(Duration::from_secs(40)),
+            );
+
             BootBehaviour {
                 identify,
                 kad,
                 relay,
                 autonat,
-                ping: ping::Behaviour::default(),
+                ping,
             }
         })?
-        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(300)))
+        // 20 мин idle-timeout: ping (каждые 20 с) поддерживает соединение,
+        // но если клиент пропал совсем — освобождаем ресурсы через 20 мин.
+        // 300 с было слишком мало при кратковременных сетевых паузах.
+        .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(1200)))
         .build();
 
     let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{libp2p_port}").parse()?;
