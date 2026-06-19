@@ -63,19 +63,18 @@ pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<Cont
     let received = peers.len();
 
     // Remember the seed we just talked to (use the host the operator typed).
-    state.store.touch(&res.peer_id_b58, host, port, 0).await;
+    let libp2p_port = state.libp2p_port;
+    state
+        .store
+        .touch(&res.peer_id_b58, host, port, libp2p_port)
+        .await;
 
     // Make sure the contacted seed is included in `peers` so callers can dial
     // it via libp2p too.
     peers.push(SeedEntry {
         host: host.to_string(),
         seed_port: port,
-        libp2p_port: res
-            .peer_auth
-            .libp2p_pubkey_proto
-            .first()
-            .map(|_| 0)
-            .unwrap_or(0), // unknown; libp2p_port is filled later from identify
+        libp2p_port,
         peer_id_b58: res.peer_id_b58.clone(),
         last_seen: crate::state::now_secs(),
     });

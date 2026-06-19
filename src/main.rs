@@ -23,9 +23,10 @@ mod storage;
 use futures::StreamExt;
 use libp2p::{
     autonat, identify, identity, kad, noise, ping, relay,
-    swarm::{NetworkBehaviour, SwarmEvent},
+    swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use std::str::FromStr;
@@ -123,6 +124,38 @@ fn entry_to_multiaddr(e: &SeedEntry) -> Option<(PeerId, Multiaddr)> {
     Some((pid, addr))
 }
 
+fn tcp_port_from_multiaddr(ma: &Multiaddr) -> Option<u16> {
+    ma.iter().find_map(|p| match p {
+        libp2p::multiaddr::Protocol::Tcp(port) => Some(port),
+        _ => None,
+    })
+}
+
+fn dial_peer_best_effort(
+    swarm: &mut libp2p::Swarm<BootBehaviour>,
+    peer_id: PeerId,
+    addrs: Vec<Multiaddr>,
+) {
+    if addrs.is_empty() {
+        return;
+    }
+    let opts = DialOpts::peer_id(peer_id)
+        .condition(libp2p::swarm::dial_opts::PeerCondition::DisconnectedAndNotDialing)
+        .addresses(addrs)
+        .build();
+    let _ = swarm.dial(opts);
+}
+
+fn group_seed_entries(entries: &[SeedEntry]) -> HashMap<PeerId, Vec<Multiaddr>> {
+    let mut grouped: HashMap<PeerId, Vec<Multiaddr>> = HashMap::new();
+    for entry in entries {
+        if let Some((pid, addr)) = entry_to_multiaddr(entry) {
+            grouped.entry(pid).or_default().push(addr);
+        }
+    }
+    grouped
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
@@ -201,7 +234,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             let store = kad::store::MemoryStore::new(pid);
             let mut cfg = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
-            cfg.set_periodic_bootstrap_interval(None);
+            cfg.set_periodic_bootstrap_interval(Some(Duration::from_secs(5 * 60)));
+            cfg.set_query_timeout(Duration::from_secs(15));
             let mut kad = kad::Behaviour::with_config(pid, store, cfg);
             kad.set_mode(Some(kad::Mode::Server));
 
@@ -257,18 +291,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
                 // Seed Kademlia with received peers and dial them.
                 let mut dialed = 0usize;
-                for entry in &rep.peers {
-                    if let Some((pid, addr)) = entry_to_multiaddr(entry) {
-                        if pid == local_peer_id {
-                            continue;
-                        }
-                        swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
-                        if let Err(e) = swarm.dial(addr.clone()) {
-                            tracing::debug!(?e, %addr, "dial skipped");
-                        } else {
-                            dialed += 1;
-                        }
+                let grouped = group_seed_entries(&rep.peers);
+                for (pid, addrs) in grouped {
+                    if pid == local_peer_id {
+                        continue;
                     }
+                    for addr in &addrs {
+                        swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                    }
+                    dial_peer_best_effort(&mut swarm, pid, addrs);
+                    dialed += 1;
                 }
                 if dialed > 0 {
                     println!("    Стартовый dial: {dialed} адр.");
@@ -285,20 +317,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     // Even in standalone mode we dial peers we already knew from previous runs.
     {
         let known = app_state.store.all().await;
+        let grouped = group_seed_entries(&known);
         let mut dialed = 0usize;
-        for entry in &known {
-            if let Some((pid, addr)) = entry_to_multiaddr(entry) {
-                if pid == local_peer_id {
-                    continue;
-                }
-                swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
-                if swarm.dial(addr.clone()).is_ok() {
-                    dialed += 1;
-                }
+        for (pid, addrs) in grouped {
+            if pid == local_peer_id {
+                continue;
             }
+            for addr in &addrs {
+                swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+            }
+            dial_peer_best_effort(&mut swarm, pid, addrs);
+            dialed += 1;
         }
         if dialed > 0 {
             tracing::info!(dialed, "dialed cached peers from {NODES_FILE}");
+            let _ = swarm.behaviour_mut().kad.bootstrap();
         }
     }
 
@@ -324,11 +357,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("Ctrl+C -- остановка.");
     println!();
 
+    let mut reconnect_tick = tokio::time::interval(Duration::from_secs(30));
+    reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let reconnect_state = app_state.clone();
+
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
                 println!("Stopping.");
                 break;
+            }
+            _ = reconnect_tick.tick() => {
+                let connected: std::collections::HashSet<PeerId> =
+                    swarm.connected_peers().copied().collect();
+                let known = reconnect_state.store.all().await;
+                for (pid, addrs) in group_seed_entries(&known) {
+                    if pid == local_peer_id || connected.contains(&pid) {
+                        continue;
+                    }
+                    for addr in &addrs {
+                        swarm.behaviour_mut().kad.add_address(&pid, addr.clone());
+                    }
+                    dial_peer_best_effort(&mut swarm, pid, addrs);
+                }
             }
             ev = swarm.select_next_some() => {
                 match ev {
@@ -344,7 +395,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         tracing::info!(%peer_id, listen = info.listen_addrs.len(), protos = info.protocols.len(), "identify received");
                         for addr in info.listen_addrs {
-                            swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                            swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                            if let Some(port) = tcp_port_from_multiaddr(&addr) {
+                                let pid_b58 = peer_id.to_base58();
+                                reconnect_state
+                                    .store
+                                    .update_libp2p_port(&pid_b58, port)
+                                    .await;
+                            }
                         }
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {

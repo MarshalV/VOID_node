@@ -123,6 +123,25 @@ impl NodesStore {
         let _ = self.persist().await;
     }
 
+    /// Обновить libp2p-порт узла после Identify (не трогая host/seed_port).
+    pub async fn update_libp2p_port(&self, peer_id_b58: &str, libp2p_port: u16) {
+        if libp2p_port == 0 {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut g = self.inner.write().await;
+            if let Some(e) = g.get_mut(peer_id_b58) {
+                e.libp2p_port = libp2p_port;
+                e.last_seen = now_secs();
+                changed = true;
+            }
+        }
+        if changed {
+            let _ = self.persist().await;
+        }
+    }
+
     #[allow(dead_code)]
     pub async fn remove(&self, peer_id_b58: &str) -> bool {
         let removed = {
