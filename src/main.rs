@@ -14,6 +14,8 @@
 //!      VOID-SEED/v1 listener (TCP on SEED_PORT) so other nodes can
 //!      bootstrap from us in turn.
 
+mod chat_protocol;
+mod relay_mailbox;
 mod seed_protocol;
 mod seed_server;
 mod seed_client;
@@ -34,6 +36,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 
+use crate::chat_protocol::V1Packet;
+use crate::relay_mailbox::RelayMailbox;
 use crate::seed_protocol::SeedEntry;
 use crate::state::AppState;
 use crate::storage::NodesStore;
@@ -41,7 +45,8 @@ use crate::storage::NodesStore;
 const IDENTITY_FILE: &str = "bootstrap_peer.key";
 const NODES_FILE: &str = "known_nodes.json";
 const IDENTIFY_PROTOCOL_VERSION: &str = "/void/v1";
-const IDENTIFY_AGENT_VERSION: &str = "void-bootstrap-node/0.3";
+const IDENTIFY_AGENT_VERSION: &str = "void-bootstrap-node/0.4";
+const CHAT_PROTOCOL: &str = "/void/chat/1.0.0";
 
 fn load_or_create_keypair(path: &Path) -> Result<identity::Keypair, Box<dyn Error + Send + Sync>> {
     if path.exists() {
@@ -67,6 +72,8 @@ struct BootBehaviour {
     relay: relay::Behaviour,
     autonat: autonat::Behaviour,
     ping: ping::Behaviour,
+    /// Store-and-forward офлайн-почты для VOID-клиентов (E2EE-конверты opaque).
+    request_response: libp2p::request_response::json::Behaviour<V1Packet, V1Packet>,
 }
 
 /// Reads one line from stdin without blocking the tokio runtime.
@@ -252,12 +259,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     .with_timeout(Duration::from_secs(40)),
             );
 
+            let rr_config = libp2p::request_response::Config::default()
+                .with_request_timeout(Duration::from_secs(30))
+                .with_max_concurrent_streams(256);
+            let request_response =
+                libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
+                    [(
+                        StreamProtocol::new(CHAT_PROTOCOL),
+                        libp2p::request_response::ProtocolSupport::Full,
+                    )],
+                    rr_config,
+                );
+
             BootBehaviour {
                 identify,
                 kad,
                 relay,
                 autonat,
                 ping,
+                request_response,
             }
         })?
         // 20 мин idle-timeout: ping (каждые 20 с) поддерживает соединение,
@@ -360,6 +380,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut reconnect_tick = tokio::time::interval(Duration::from_secs(30));
     reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reconnect_state = app_state.clone();
+    let mut relay_mail_store = RelayMailbox::load();
+    tracing::info!(
+        "offline relay mailbox: {} получателей на диске",
+        relay_mail_store.len()
+    );
 
     loop {
         tokio::select! {
@@ -419,6 +444,70 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         tracing::debug!(?e, "autonat event");
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Ping(_)) => {}
+                    SwarmEvent::Behaviour(BootBehaviourEvent::RequestResponse(
+                        libp2p::request_response::Event::Message { message, .. },
+                    )) => {
+                        if let libp2p::request_response::Message::Request { request, channel, .. } =
+                            message
+                        {
+                            match request {
+                                V1Packet::OfflineMailboxStore {
+                                    recipient,
+                                    envelopes,
+                                } => {
+                                    let n = envelopes.len();
+                                    if RelayMailbox::merge(
+                                        &mut relay_mail_store,
+                                        &recipient,
+                                        envelopes,
+                                    ) {
+                                        let _ = RelayMailbox::save(&relay_mail_store);
+                                    }
+                                    tracing::info!(
+                                        recipient = %recipient,
+                                        stored = n,
+                                        "relay: stored offline mail"
+                                    );
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .request_response
+                                        .send_response(channel, V1Packet::Ack);
+                                }
+                                V1Packet::OfflineMailboxQuery { recipient } => {
+                                    let envs =
+                                        RelayMailbox::take_for(&mut relay_mail_store, &recipient);
+                                    if !envs.is_empty() {
+                                        let _ = RelayMailbox::save(&relay_mail_store);
+                                        tracing::info!(
+                                            recipient = %recipient,
+                                            count = envs.len(),
+                                            "relay: delivering offline mail"
+                                        );
+                                    }
+                                    let response = if envs.is_empty() {
+                                        V1Packet::Ack
+                                    } else {
+                                        V1Packet::OfflineMailboxDeliver { envelopes: envs }
+                                    };
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .request_response
+                                        .send_response(channel, response);
+                                }
+                                _ => {
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .request_response
+                                        .send_response(channel, V1Packet::Ack);
+                                }
+                            }
+                        }
+                    }
+                    SwarmEvent::Behaviour(BootBehaviourEvent::RequestResponse(
+                        libp2p::request_response::Event::OutboundFailure { peer, error, .. },
+                    )) => {
+                        tracing::debug!(%peer, ?error, "chat RR outbound failure");
+                    }
                     _ => {}
                 }
             }

@@ -17,6 +17,8 @@ libp2p = { version = "0.56", features = [
     "identify",
     "relay",
     "autonat",
+    "request-response",
+    "json",
     "macros",
     "ed25519",
 ] }
