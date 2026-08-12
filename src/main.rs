@@ -246,7 +246,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut kad = kad::Behaviour::with_config(pid, store, cfg);
             kad.set_mode(Some(kad::Mode::Server));
 
-            let relay = relay::Behaviour::new(pid, relay::Config::default());
+            // Private VOID relay: default libp2p limits (16 circuits, 128 KiB,
+            // 2 min, 1 reservation/circuit per IP per minute) drop same-NAT
+            // clients and kill chat. Both peers often share one public IP.
+            let mut relay_cfg = relay::Config::default();
+            relay_cfg.max_reservations = 1024;
+            relay_cfg.max_reservations_per_peer = 32;
+            relay_cfg.max_circuits = 256;
+            relay_cfg.max_circuits_per_peer = 32;
+            relay_cfg.max_circuit_duration = Duration::from_secs(60 * 60);
+            relay_cfg.max_circuit_bytes = 64 * 1024 * 1024;
+            relay_cfg.reservation_rate_limiters.clear();
+            relay_cfg.circuit_src_rate_limiters.clear();
+            let relay = relay::Behaviour::new(pid, relay_cfg);
             let autonat = autonat::Behaviour::new(pid, autonat::Config::default());
 
             // Ping: интервал 20 с, таймаут 40 с.
@@ -420,8 +432,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                         tracing::info!(%peer_id, ?endpoint, "connection");
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, .. } => {
-                        tracing::debug!(%peer_id, "connection closed");
+                    SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
+                        tracing::info!(%peer_id, ?cause, remaining = num_established, "connection closed");
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         tracing::info!(%peer_id, listen = info.listen_addrs.len(), protos = info.protocols.len(), "identify received");
@@ -440,7 +452,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         tracing::debug!(%peer_id, ?error, "identify error");
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Relay(e)) => {
-                        tracing::debug!(?e, "relay event");
+                        match &e {
+                            relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
+                                tracing::info!(peer = %src_peer_id, "relay: reservation accepted");
+                            }
+                            relay::Event::ReservationReqDenied { src_peer_id, status, .. } => {
+                                tracing::warn!(peer = %src_peer_id, ?status, "relay: reservation denied");
+                            }
+                            relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, status, .. } => {
+                                tracing::warn!(
+                                    src = %src_peer_id,
+                                    dst = %dst_peer_id,
+                                    ?status,
+                                    "relay: circuit denied"
+                                );
+                            }
+                            relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id, .. } => {
+                                tracing::info!(
+                                    src = %src_peer_id,
+                                    dst = %dst_peer_id,
+                                    "relay: circuit accepted"
+                                );
+                            }
+                            _ => tracing::debug!(?e, "relay event"),
+                        }
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. })) => {
                         tracing::debug!(%peer, "kad routing updated");
@@ -480,15 +515,12 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         .send_response(channel, V1Packet::Ack);
                                 }
                                 V1Packet::OfflineMailboxQuery { recipient } => {
-                                    // Batched deliver: wiping the whole mailbox into one
-                                    // response drops voice mail when RR size limit fails.
-                                    let envs = RelayMailbox::take_batch(
-                                        &mut relay_mail_store,
+                                    let envs = RelayMailbox::copy_batch(
+                                        &relay_mail_store,
                                         &recipient,
                                         crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
                                     );
                                     if !envs.is_empty() {
-                                        let _ = RelayMailbox::save(&relay_mail_store);
                                         tracing::info!(
                                             recipient = %recipient,
                                             count = envs.len(),
