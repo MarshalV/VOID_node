@@ -9,7 +9,15 @@ use serde::{Deserialize, Serialize};
 use crate::chat_protocol::OfflineEnvelope;
 
 const FILE: &str = "relay_mailbox.bin";
-const MAX_PER_RECIPIENT: usize = 256;
+/// Voice ~3MB ~= 128 chunks; allow several pending voice messages.
+const MAX_PER_RECIPIENT: usize = 1024;
+const MAX_BYTES_PER_RECIPIENT: usize = 32 * 1024 * 1024;
+/// Batch size for OfflineMailboxDeliver (JSON expands ~3x).
+pub(crate) const DELIVER_BATCH_PLAIN_BYTES: usize = 512 * 1024;
+
+fn envelope_len(env: &OfflineEnvelope) -> usize {
+    env.ct.len() + 96
+}
 
 #[derive(Default, Serialize, Deserialize)]
 struct RelayData {
@@ -25,9 +33,15 @@ impl RelayMailbox {
             return HashMap::new();
         }
         match std::fs::read(FILE) {
-            Ok(bytes) => serde_json::from_slice::<RelayData>(&bytes)
-                .map(|d| d.by_recipient)
-                .unwrap_or_default(),
+            Ok(bytes) => {
+                if let Ok(d) = bincode::deserialize::<RelayData>(&bytes) {
+                    d.by_recipient
+                } else {
+                    serde_json::from_slice::<RelayData>(&bytes)
+                        .map(|d| d.by_recipient)
+                        .unwrap_or_default()
+                }
+            }
             Err(_) => HashMap::new(),
         }
     }
@@ -36,7 +50,7 @@ impl RelayMailbox {
         let data = RelayData {
             by_recipient: map.clone(),
         };
-        let bytes = serde_json::to_vec(&data)?;
+        let bytes = bincode::serialize(&data)?;
         std::fs::write(format!("{FILE}.tmp"), &bytes)?;
         if Path::new(FILE).exists() {
             let _ = std::fs::remove_file(format!("{FILE}.bak"));
@@ -65,13 +79,76 @@ impl RelayMailbox {
             slot.drain(0..drop);
             changed = true;
         }
+        let mut total: usize = slot.iter().map(envelope_len).sum();
+        while total > MAX_BYTES_PER_RECIPIENT && !slot.is_empty() {
+            total -= envelope_len(&slot.remove(0));
+            changed = true;
+        }
         changed
     }
 
-    pub(crate) fn take_for(
+    /// Take a response-sized batch; leave the rest for the next Query.
+    pub(crate) fn take_batch(
         map: &mut HashMap<String, Vec<OfflineEnvelope>>,
         recipient: &str,
+        max_plain_bytes: usize,
     ) -> Vec<OfflineEnvelope> {
-        map.remove(recipient).unwrap_or_default()
+        let Some(slot) = map.get_mut(recipient) else {
+            return Vec::new();
+        };
+        if slot.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut used = 0usize;
+        while let Some(env) = slot.first() {
+            let n = envelope_len(env);
+            if !out.is_empty() && used.saturating_add(n) > max_plain_bytes {
+                break;
+            }
+            out.push(slot.remove(0));
+            used = used.saturating_add(n);
+            if used >= max_plain_bytes {
+                break;
+            }
+        }
+        if slot.is_empty() {
+            map.remove(recipient);
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn env(id: &str, ct_len: usize) -> OfflineEnvelope {
+        OfflineEnvelope {
+            v: 1,
+            sender: "s".into(),
+            sender_pk: [0u8; 32],
+            message_id: id.into(),
+            kind: "voice_chunk".into(),
+            eph: [0u8; 32],
+            nonce: [0u8; 12],
+            ct: vec![0u8; ct_len],
+        }
+    }
+
+    #[test]
+    fn take_batch_does_not_wipe_whole_mailbox() {
+        let mut map = HashMap::new();
+        let recip = "peer";
+        let big = (0..20)
+            .map(|i| env(&format!("c{i}"), 40_000))
+            .collect::<Vec<_>>();
+        assert!(RelayMailbox::merge(&mut map, recip, big));
+        let first = RelayMailbox::take_batch(&mut map, recip, 100_000);
+        assert!(!first.is_empty());
+        assert!(map.get(recip).map(|s| !s.is_empty()).unwrap_or(false));
+        let second = RelayMailbox::take_batch(&mut map, recip, 100_000);
+        assert!(!second.is_empty());
+        assert_ne!(first[0].message_id, second[0].message_id);
     }
 }

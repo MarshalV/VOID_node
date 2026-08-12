@@ -40,6 +40,11 @@ pub(crate) enum V1Packet {
         #[serde(default)]
         addrs: Vec<String>,
     },
+    /// Client→client NAT hint; bootstrap just Acks.
+    DialBack {
+        #[serde(default)]
+        circuit_addrs: Vec<String>,
+    },
     OfflineMailboxStore {
         recipient: String,
         envelopes: Vec<OfflineEnvelope>,

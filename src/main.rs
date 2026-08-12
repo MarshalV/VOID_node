@@ -260,16 +260,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             );
 
             let rr_config = libp2p::request_response::Config::default()
-                .with_request_timeout(Duration::from_secs(30))
+                .with_request_timeout(Duration::from_secs(90))
                 .with_max_concurrent_streams(256);
-            let request_response =
-                libp2p::request_response::json::Behaviour::<V1Packet, V1Packet>::new(
-                    [(
-                        StreamProtocol::new(CHAT_PROTOCOL),
-                        libp2p::request_response::ProtocolSupport::Full,
-                    )],
-                    rr_config,
-                );
+            let rr_codec =
+                libp2p::request_response::json::codec::Codec::<V1Packet, V1Packet>::default()
+                    .set_request_size_maximum(4 * 1024 * 1024)
+                    .set_response_size_maximum(16 * 1024 * 1024);
+            let request_response = libp2p::request_response::Behaviour::<
+                libp2p::request_response::json::codec::Codec<V1Packet, V1Packet>,
+            >::with_codec(
+                rr_codec,
+                [(
+                    StreamProtocol::new(CHAT_PROTOCOL),
+                    libp2p::request_response::ProtocolSupport::Full,
+                )],
+                rr_config,
+            );
 
             BootBehaviour {
                 identify,
@@ -445,7 +451,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Ping(_)) => {}
                     SwarmEvent::Behaviour(BootBehaviourEvent::RequestResponse(
-                        libp2p::request_response::Event::Message { message, .. },
+                        libp2p::request_response::Event::Message { peer, message, .. },
                     )) => {
                         if let libp2p::request_response::Message::Request { request, channel, .. } =
                             message
@@ -474,14 +480,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         .send_response(channel, V1Packet::Ack);
                                 }
                                 V1Packet::OfflineMailboxQuery { recipient } => {
-                                    let envs =
-                                        RelayMailbox::take_for(&mut relay_mail_store, &recipient);
+                                    // Batched deliver: wiping the whole mailbox into one
+                                    // response drops voice mail when RR size limit fails.
+                                    let envs = RelayMailbox::take_batch(
+                                        &mut relay_mail_store,
+                                        &recipient,
+                                        crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
+                                    );
                                     if !envs.is_empty() {
                                         let _ = RelayMailbox::save(&relay_mail_store);
                                         tracing::info!(
                                             recipient = %recipient,
                                             count = envs.len(),
-                                            "relay: delivering offline mail"
+                                            "relay: delivering offline mail batch"
                                         );
                                     }
                                     let response = if envs.is_empty() {
@@ -493,6 +504,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         .behaviour_mut()
                                         .request_response
                                         .send_response(channel, response);
+                                }
+                                V1Packet::Encrypted { .. } => {
+                                    // Live chat is peer-to-peer. Ack here would look like
+                                    // delivery and stop client retries while the other
+                                    // peer never sees the text (files use /void/file).
+                                    tracing::debug!(
+                                        %peer,
+                                        "relay: ignoring live Encrypted (not a chat forwarder)"
+                                    );
                                 }
                                 _ => {
                                     let _ = swarm
