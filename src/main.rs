@@ -399,6 +399,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reconnect_state = app_state.clone();
     let mut relay_mail_store = RelayMailbox::load();
+    let mut prekey_dir: HashMap<String, [u8; 32]> = HashMap::new();
     tracing::info!(
         "offline relay mailbox: {} получателей на диске",
         relay_mail_store.len()
@@ -531,6 +532,38 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         V1Packet::Ack
                                     } else {
                                         V1Packet::OfflineMailboxDeliver { envelopes: envs }
+                                    };
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .request_response
+                                        .send_response(channel, response);
+                                }
+                                V1Packet::PrekeyPut {
+                                    peer_id,
+                                    public_key,
+                                } => {
+                                    if public_key != [0u8; 32] && !peer_id.is_empty() {
+                                        prekey_dir.insert(peer_id.clone(), public_key);
+                                        tracing::info!(peer = %peer_id, "relay: prekey stored");
+                                    }
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .request_response
+                                        .send_response(channel, V1Packet::Ack);
+                                }
+                                V1Packet::PrekeyGet { peer_id } => {
+                                    let response = match prekey_dir.get(&peer_id) {
+                                        Some(pk) => {
+                                            tracing::info!(peer = %peer_id, "relay: prekey hit");
+                                            V1Packet::PrekeyOffer {
+                                                peer_id: peer_id.clone(),
+                                                public_key: *pk,
+                                            }
+                                        }
+                                        None => {
+                                            tracing::debug!(peer = %peer_id, "relay: prekey miss");
+                                            V1Packet::Ack
+                                        }
                                     };
                                     let _ = swarm
                                         .behaviour_mut()

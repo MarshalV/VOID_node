@@ -55,6 +55,19 @@ pub(crate) enum V1Packet {
     OfflineMailboxDeliver {
         envelopes: Vec<OfflineEnvelope>,
     },
+    PrekeyPut {
+        peer_id: String,
+        #[serde(default)]
+        public_key: [u8; 32],
+    },
+    PrekeyGet {
+        peer_id: String,
+    },
+    PrekeyOffer {
+        peer_id: String,
+        #[serde(default)]
+        public_key: [u8; 32],
+    },
     Encrypted {
         #[serde(default)]
         header: MessageHeader,
