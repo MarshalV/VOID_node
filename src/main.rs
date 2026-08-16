@@ -536,8 +536,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             }
                         }
                     }
+                    SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
+                        tracing::info!(%peer_id, "identify sent");
+                    }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
-                        tracing::debug!(%peer_id, ?error, "identify error");
+                        tracing::info!(%peer_id, ?error, "identify error");
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Relay(e)) => {
                         match &e {
