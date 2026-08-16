@@ -52,6 +52,7 @@ use crate::storage::NodesStore;
 
 const IDENTITY_FILE: &str = "bootstrap_peer.key";
 const NODES_FILE: &str = "known_nodes.json";
+const LANG_FILE: &str = "void.lang";
 const IDENTIFY_PROTOCOL_VERSION: &str = "/void/v1";
 const IDENTIFY_AGENT_VERSION: &str = "void-bootstrap-node/0.4";
 const CHAT_PROTOCOL: &str = "/void/chat/1.0.0";
@@ -113,23 +114,56 @@ fn enable_utf8_stdio() {
     }
 }
 
+fn load_saved_lang() -> Option<Lang> {
+    std::fs::read_to_string(LANG_FILE)
+        .ok()
+        .and_then(|s| Lang::parse(&s))
+}
+
+fn save_lang(lang: Lang) {
+    let _ = std::fs::write(LANG_FILE, lang.code());
+}
+
+fn stdin_is_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal()
+}
+
 async fn prompt_language() -> Lang {
     if let Ok(v) = std::env::var("VOID_LANG") {
         if let Some(lang) = Lang::parse(&v) {
+            println!("{}", lang.selected());
             return lang;
         }
     }
-    for _ in 0..5 {
-        let raw = prompt_line(Lang::choose_prompt()).await;
+    let saved = load_saved_lang();
+    if !stdin_is_terminal() {
+        let lang = saved.unwrap_or(Lang::En);
+        println!("{}", lang.selected());
+        return lang;
+    }
+    println!();
+    loop {
+        let prompt = match saved {
+            Some(s) => s.choose_prompt_with_default(),
+            None => Lang::choose_prompt().to_string(),
+        };
+        let raw = prompt_line(&prompt).await;
         if raw.is_empty() {
-            return Lang::En;
+            if let Some(lang) = saved {
+                println!("{}", lang.selected());
+                return lang;
+            }
+        println!("{}", Lang::En.invalid_language());
+            continue;
         }
         if let Some(lang) = Lang::parse(&raw) {
+            save_lang(lang);
+            println!("{}", lang.selected());
             return lang;
         }
         println!("{}", Lang::En.invalid_language());
     }
-    Lang::En
 }
 
 fn split_host_port(raw: &str, default_port: u16) -> (String, u16) {
@@ -207,6 +241,8 @@ fn group_seed_entries(entries: &[SeedEntry]) -> HashMap<PeerId, Vec<Multiaddr>> 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     enable_utf8_stdio();
+    let lang = prompt_language().await;
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -242,8 +278,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         public_host,
     });
 
-    println!();
-    let lang = prompt_language().await;
     println!();
     println!("{}", lang.banner_title());
     println!("{} {}", lang.peer_id(), local_peer_id);

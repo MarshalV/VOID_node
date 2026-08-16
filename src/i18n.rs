@@ -19,9 +19,34 @@ impl Lang {
         }
     }
 
+    pub fn code(self) -> &'static str {
+        match self {
+            Self::En => "en",
+            Self::Ru => "ru",
+            Self::Zh => "ch",
+            Self::Fr => "fr",
+        }
+    }
+
     /// Shown before a language is chosen — all four labels so any operator can pick.
     pub fn choose_prompt() -> &'static str {
         "Language / Язык / 语言 / Langue  [en / ru / ch / fr]: "
+    }
+
+    pub fn choose_prompt_with_default(self) -> String {
+        format!(
+            "Language / Язык / 语言 / Langue  [en / ru / ch / fr]  (Enter = {}): ",
+            self.code()
+        )
+    }
+
+    pub fn selected(self) -> String {
+        match self {
+            Self::En => "Language: English".into(),
+            Self::Ru => "Язык: русский".into(),
+            Self::Zh => "语言：中文".into(),
+            Self::Fr => "Langue : français".into(),
+        }
     }
 
     pub fn invalid_language(self) -> &'static str {
