@@ -74,5 +74,17 @@ pub(crate) enum V1Packet {
         #[serde(default)]
         ciphertext: Vec<u8>,
     },
+    Onion {
+        #[serde(default)]
+        eph: [u8; 32],
+        #[serde(default)]
+        nonce: [u8; 12],
+        #[serde(default)]
+        ct: Vec<u8>,
+    },
+    OnionDrop {
+        src: String,
+        packet: Box<V1Packet>,
+    },
     Ack,
 }

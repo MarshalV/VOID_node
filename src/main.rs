@@ -1,5 +1,10 @@
 //! VOID bootstrap / seed / relay node.
 //!
+//! E2EE chat payload is opaque. Circuit relay still sees one-hop metadata.
+//! VOID_ONION_v1: clients wrap chat through 1..=3 of these nodes. This process
+//! unwraps one layer and forwards `next` (another node or the recipient).
+//! One hop still correlates Alice↔Bob; two+ hops split IP and destination.
+//!
 //! At startup the node:
 //!   1. asks the operator (via stdin) for the IP[:port] of another VOID
 //!      seed to join. Empty input means "standalone" -- the node still
@@ -15,6 +20,8 @@
 //!      bootstrap from us in turn.
 
 mod chat_protocol;
+mod i18n;
+mod onion;
 mod relay_mailbox;
 mod seed_protocol;
 mod seed_server;
@@ -37,6 +44,7 @@ use std::time::Duration;
 use tokio::signal;
 
 use crate::chat_protocol::V1Packet;
+use crate::i18n::Lang;
 use crate::relay_mailbox::RelayMailbox;
 use crate::seed_protocol::SeedEntry;
 use crate::state::AppState;
@@ -89,6 +97,39 @@ async fn prompt_line(question: &str) -> String {
     })
     .await
     .unwrap_or_default()
+}
+
+fn enable_utf8_stdio() {
+    #[cfg(windows)]
+    unsafe {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetConsoleOutputCP(wCodePageID: u32) -> i32;
+            fn SetConsoleCP(wCodePageID: u32) -> i32;
+        }
+        const UTF8: u32 = 65001;
+        SetConsoleOutputCP(UTF8);
+        SetConsoleCP(UTF8);
+    }
+}
+
+async fn prompt_language() -> Lang {
+    if let Ok(v) = std::env::var("VOID_LANG") {
+        if let Some(lang) = Lang::parse(&v) {
+            return lang;
+        }
+    }
+    for _ in 0..5 {
+        let raw = prompt_line(Lang::choose_prompt()).await;
+        if raw.is_empty() {
+            return Lang::En;
+        }
+        if let Some(lang) = Lang::parse(&raw) {
+            return lang;
+        }
+        println!("{}", Lang::En.invalid_language());
+    }
+    Lang::En
 }
 
 fn split_host_port(raw: &str, default_port: u16) -> (String, u16) {
@@ -165,6 +206,7 @@ fn group_seed_entries(entries: &[SeedEntry]) -> HashMap<PeerId, Vec<Multiaddr>> 
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    enable_utf8_stdio();
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -174,6 +216,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let keypair = load_or_create_keypair(Path::new(IDENTITY_FILE))?;
     let local_peer_id = keypair.public().to_peer_id();
+    let onion_sk = crate::onion::load_or_create_sk(Path::new(crate::onion::ONION_KEY_FILE))?;
+    let onion_pk = crate::onion::public_bytes(&onion_sk);
+    let identify_agent = crate::onion::agent_version_with_pk(IDENTIFY_AGENT_VERSION, &onion_pk);
 
     let libp2p_port: u16 = std::env::var("LISTEN_PORT")
         .ok()
@@ -198,21 +243,24 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     println!();
-    println!("=== VOID bootstrap (seed + relay + DNS-Seed) ===");
-    println!("PeerId:       {}", local_peer_id);
-    println!("libp2p port:  {} (env LISTEN_PORT)", libp2p_port);
-    println!("seed  port:   {} (env SEED_PORT)", seed_port);
+    let lang = prompt_language().await;
+    println!();
+    println!("{}", lang.banner_title());
+    println!("{} {}", lang.peer_id(), local_peer_id);
+    println!("{}{} (env LISTEN_PORT)", lang.libp2p_port(), libp2p_port);
+    println!("{}{} (env SEED_PORT)", lang.seed_port(), seed_port);
     if !app_state.public_host.is_empty() {
-        println!("public host:  {} (env PUBLIC_HOST)", app_state.public_host);
+        println!("{}{} (env PUBLIC_HOST)", lang.public_host(), app_state.public_host);
     }
-    println!("known nodes:  {} (loaded from {NODES_FILE})", app_state.store.len().await);
+    println!(
+        "{}",
+        lang.known_nodes(app_state.store.len().await, NODES_FILE)
+    );
+    println!("{}{}", lang.onion_pk(), crate::onion::hex32(&onion_pk));
     println!();
 
     // ---------- ask the operator for an entry-point ----------
-    let question = format!(
-        "Введите IP[:port] другой VOID-ноды для подключения к сети\n  \
-         (Enter -- работать как изолированная сеть; порт по умолчанию {seed_port}): "
-    );
+    let question = lang.join_prompt(seed_port);
     let answer = prompt_line(&question).await;
     println!();
 
@@ -235,7 +283,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             let identify = identify::Behaviour::new(
                 identify::Config::new(IDENTIFY_PROTOCOL_VERSION.into(), key.public())
-                    .with_agent_version(IDENTIFY_AGENT_VERSION.into())
+                    .with_agent_version(identify_agent.clone())
                     .with_push_listen_addr_updates(true),
             );
 
@@ -313,19 +361,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     // ---------- seed exchange (encrypted) ----------
     if answer.is_empty() {
-        println!(">>> Режим: ИЗОЛИРОВАННАЯ сеть (никого не запрашиваем).");
-        println!(">>> Другие ноды смогут подключаться к нам по seed-порту {seed_port}.");
+        let (a, b) = lang.isolated_mode(seed_port);
+        println!("{a}");
+        println!("{b}");
     } else {
         let (host, port) = split_host_port(&answer, seed_port);
-        println!(">>> Подключаемся к {host}:{port} (зашифрованный handshake VOID-SEED/v1)...");
+        println!("{}", lang.connecting(&host, port));
         match seed_client::contact(app_state.clone(), &host, port).await {
             Ok(rep) => {
-                println!(">>> УСПЕХ. Удалённый узел подтвердил принадлежность к VOID.");
-                println!("    PeerId : {}", rep.peer_id_b58);
-                println!("    Agent  : {}", rep.agent);
-                println!("    Передано наших : {}", rep.sent);
-                println!("    Получено пиров : {}", rep.received);
-                println!("    Новых добавлено: {}", rep.added);
+                println!("{}", lang.join_ok());
+                println!("{} {}", lang.join_peer_id(), rep.peer_id_b58);
+                println!("{} {}", lang.join_agent(), rep.agent);
+                println!("{}", lang.join_sent(rep.sent));
+                println!("{}", lang.join_received(rep.received));
+                println!("{}", lang.join_added(rep.added));
 
                 // Seed Kademlia with received peers and dial them.
                 let mut dialed = 0usize;
@@ -341,13 +390,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     dialed += 1;
                 }
                 if dialed > 0 {
-                    println!("    Стартовый dial: {dialed} адр.");
+                    println!("{}", lang.starter_dial(dialed));
                     let _ = swarm.behaviour_mut().kad.bootstrap();
                 }
             }
             Err(e) => {
-                eprintln!(">>> ОШИБКА подключения: {e:#}");
-                eprintln!(">>> Стартую как изолированная сеть -- другие смогут подключиться к нам.");
+                eprintln!("{}", lang.join_err(&format!("{e:#}")));
+                eprintln!("{}", lang.join_err_fallback());
             }
         }
     }
@@ -382,17 +431,21 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     });
 
     println!();
-    println!("Multiaddr templates for VOID clients:");
+    println!("{}", lang.multiaddr_header());
     println!("  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{}", libp2p_port, local_peer_id);
     println!("  /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{}", libp2p_port, local_peer_id);
     println!();
-    println!("Чтобы другая нода присоединилась через нас, передайте им:");
+    println!("{}", lang.share_seed());
     println!(
         "  {}:{}",
-        if app_state.public_host.is_empty() { "<ВАШ_ПУБЛИЧНЫЙ_IP>" } else { app_state.public_host.as_str() },
+        if app_state.public_host.is_empty() {
+            lang.public_ip_placeholder()
+        } else {
+            app_state.public_host.as_str()
+        },
         seed_port
     );
-    println!("Ctrl+C -- остановка.");
+    println!("{}", lang.ctrl_c());
     println!();
 
     let mut reconnect_tick = tokio::time::interval(Duration::from_secs(30));
@@ -408,7 +461,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     loop {
         tokio::select! {
             _ = signal::ctrl_c() => {
-                println!("Stopping.");
+                println!("{}", lang.stopping());
                 break;
             }
             _ = reconnect_tick.tick() => {
@@ -569,6 +622,41 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         .behaviour_mut()
                                         .request_response
                                         .send_response(channel, response);
+                                }
+                                V1Packet::Onion { eph, nonce, ct } => {
+                                    match crate::onion::open(&onion_sk, &eph, &nonce, &ct) {
+                                        Ok(payload) => match payload.next.parse::<PeerId>() {
+                                            Ok(next) => {
+                                                match serde_json::from_value::<V1Packet>(
+                                                    payload.inner,
+                                                ) {
+                                                    Ok(inner) => {
+                                                        let live = swarm.is_connected(&next);
+                                                        tracing::info!(
+                                                            %next,
+                                                            connected = live,
+                                                            "onion: forward"
+                                                        );
+                                                        let _ = swarm
+                                                            .behaviour_mut()
+                                                            .request_response
+                                                            .send_request(&next, inner);
+                                                    }
+                                                    Err(e) => {
+                                                        tracing::warn!("onion: inner decode: {e}")
+                                                    }
+                                                }
+                                            }
+                                            Err(_) => {
+                                                tracing::warn!("onion: bad next hop id")
+                                            }
+                                        },
+                                        Err(e) => tracing::debug!("onion: open failed: {e}"),
+                                    }
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .request_response
+                                        .send_response(channel, V1Packet::Ack);
                                 }
                                 V1Packet::Encrypted { .. } => {
                                     // Live chat is peer-to-peer. Ack here would look like
