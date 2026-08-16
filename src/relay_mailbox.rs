@@ -87,34 +87,9 @@ impl RelayMailbox {
         changed
     }
 
-    /// Copy a response-sized batch without deleting. Client dedups by
-    /// `message_id`; deleting on Query used to drop mail if ingest failed.
-    pub(crate) fn copy_batch(
-        map: &HashMap<String, Vec<OfflineEnvelope>>,
-        recipient: &str,
-        max_plain_bytes: usize,
-    ) -> Vec<OfflineEnvelope> {
-        let Some(slot) = map.get(recipient) else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        let mut used = 0usize;
-        for env in slot {
-            let n = envelope_len(env);
-            if !out.is_empty() && used.saturating_add(n) > max_plain_bytes {
-                break;
-            }
-            out.push(env.clone());
-            used = used.saturating_add(n);
-            if used >= max_plain_bytes {
-                break;
-            }
-        }
-        out
-    }
-
     /// Take a response-sized batch; leave the rest for the next Query.
-    #[cfg(test)]
+    /// Must delete on deliver: `copy_batch` + client re-query was a tight
+    /// loop that saturated yamux and blocked Hop reservations.
     pub(crate) fn take_batch(
         map: &mut HashMap<String, Vec<OfflineEnvelope>>,
         recipient: &str,

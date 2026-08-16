@@ -606,12 +606,13 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         .send_response(channel, V1Packet::Ack);
                                 }
                                 V1Packet::OfflineMailboxQuery { recipient } => {
-                                    let envs = RelayMailbox::copy_batch(
-                                        &relay_mail_store,
+                                    let envs = RelayMailbox::take_batch(
+                                        &mut relay_mail_store,
                                         &recipient,
                                         crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
                                     );
                                     if !envs.is_empty() {
+                                        let _ = RelayMailbox::save(&relay_mail_store);
                                         tracing::info!(
                                             recipient = %recipient,
                                             count = envs.len(),
