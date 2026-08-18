@@ -30,6 +30,29 @@ pub fn agent_version_with_pk(base: &str, pk: &[u8; 32]) -> String {
     format!("{base};onion={}", hex32(pk))
 }
 
+pub fn parse_hex32(s: &str) -> Option<[u8; 32]> {
+    let s = s.trim();
+    if s.len() != 64 || !s.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        out[i] = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).ok()?;
+    }
+    Some(out)
+}
+
+/// `void-bootstrap-node/0.4;onion=<64 hex>`
+pub fn parse_pk_from_agent(agent: &str) -> Option<[u8; 32]> {
+    let rest = agent.split(";onion=").nth(1)?;
+    let hex = rest.split(';').next()?.trim();
+    parse_hex32(hex)
+}
+
+pub fn is_bootstrap_agent(agent: &str) -> bool {
+    agent.starts_with("void-bootstrap-node/")
+}
+
 fn aead_key(shared: &[u8; 32]) -> Result<[u8; 32]> {
     let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared);
     let mut okm = [0u8; 32];

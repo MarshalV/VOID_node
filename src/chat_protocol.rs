@@ -24,6 +24,16 @@ pub(crate) struct MessageHeader {
     pub(crate) n: u32,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub(crate) struct OnionHopHint {
+    #[serde(default)]
+    pub(crate) peer_id: String,
+    #[serde(default)]
+    pub(crate) pk_hex: String,
+    #[serde(default)]
+    pub(crate) addrs: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) enum V1Packet {
     Hello {
@@ -39,6 +49,9 @@ pub(crate) enum V1Packet {
     BootstrapGossip {
         #[serde(default)]
         addrs: Vec<String>,
+        /// Other VOID nodes' onion X25519 keys (clients wrap 1/2/3 hops).
+        #[serde(default)]
+        onion_keys: Vec<OnionHopHint>,
     },
     /// Client→client NAT hint; bootstrap just Acks.
     DialBack {
