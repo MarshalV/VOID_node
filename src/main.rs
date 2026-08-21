@@ -3,9 +3,10 @@
 //! E2EE chat payload is opaque. Circuit relay still sees one-hop metadata.
 //! VOID_ONION_v1: clients wrap live chat through 1, 2, or 3 of these nodes
 //! (one node → one hop; two nodes → both; three or more → three random).
-//! This process unwraps one layer and forwards `next` (another node or the
-//! recipient), dialing if needed. One hop still correlates Alice↔Bob;
-//! two+ hops split IP and destination.
+//! Default logs do not print client PeerIds or remote IPs. The TCP stack
+//! on the host can still see connections; this process does not persist
+//! a who-connected list. `known_nodes` is sealed (AEAD) so it cannot be
+//! casually edited as JSON.
 //!
 //! At startup the node:
 //!   1. asks the operator (via stdin) for the IP[:port] of another VOID
@@ -25,9 +26,10 @@ mod chat_protocol;
 mod i18n;
 mod onion;
 mod relay_mailbox;
+mod seal;
+mod seed_client;
 mod seed_protocol;
 mod seed_server;
-mod seed_client;
 mod state;
 mod storage;
 
@@ -462,7 +464,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         std::env::var("SEED_BIND").unwrap_or_else(|_| format!("0.0.0.0:{seed_port}"));
     let public_host: String = std::env::var("PUBLIC_HOST").unwrap_or_default();
 
-    let store = NodesStore::load(NODES_FILE).await?;
+    let store = NodesStore::load(NODES_FILE, &keypair).await?;
+    let mailbox_key = crate::seal::seal_key(&keypair, b"VOID_MAILBOX_v1")?;
     let app_state = Arc::new(AppState {
         keypair: keypair.clone(),
         my_peer_id_b58: local_peer_id.to_base58(),
@@ -679,16 +682,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut reconnect_tick = tokio::time::interval(Duration::from_secs(30));
     reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reconnect_state = app_state.clone();
-    let mut relay_mail_store = RelayMailbox::load();
+    let mut relay_mail_store = RelayMailbox::load(Some(&mailbox_key));
+    if !relay_mail_store.is_empty() {
+        let _ = RelayMailbox::save(&relay_mail_store, Some(&mailbox_key));
+    }
     let mut prekey_dir: HashMap<String, [u8; 32]> = HashMap::new();
     let mut onion_dir: HashMap<PeerId, OnionPeer> = HashMap::new();
     let mut pending_onion: HashMap<PeerId, Vec<V1Packet>> = HashMap::new();
     let mut listen_addrs: Vec<Multiaddr> = Vec::new();
     let mut onion_gossiped: HashSet<PeerId> = HashSet::new();
-    tracing::info!(
-        "offline relay mailbox: {} получателей на диске",
-        relay_mail_store.len()
-    );
+    tracing::info!("offline relay mailbox: {} slots on disk", relay_mail_store.len());
 
     loop {
         tokio::select! {
@@ -718,18 +721,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                         tracing::info!(%address, "listening");
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                        tracing::info!(%peer_id, ?endpoint, "connection");
+                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                        tracing::debug!("connection established");
                         flush_pending_onion(&mut swarm, &mut pending_onion, peer_id);
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, cause, num_established, .. } => {
-                        tracing::info!(%peer_id, ?cause, remaining = num_established, "connection closed");
+                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                        tracing::debug!(remaining = num_established, "connection closed");
                         if num_established == 0 {
                             onion_gossiped.remove(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
-                        tracing::info!(%peer_id, listen = info.listen_addrs.len(), protos = info.protocols.len(), "identify received");
+                        tracing::debug!("identify received");
                         let listen_copy = info.listen_addrs.clone();
                         for addr in info.listen_addrs {
                             swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
@@ -744,7 +747,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         if let Some(pk) = crate::onion::parse_pk_from_agent(&info.agent_version) {
                             let is_new = !onion_dir.contains_key(&peer_id);
                             remember_onion_peer(&mut onion_dir, peer_id, pk, listen_copy);
-                            tracing::info!(peer = %peer_id, "onion: learned hop key");
+                            tracing::debug!("onion: learned hop key");
                             if is_new {
                                 let self_addrs = advertised_self_addrs(
                                     &listen_addrs,
@@ -794,34 +797,25 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 .send_request(&peer_id, packet);
                         }
                     }
-                    SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Sent { peer_id, .. })) => {
-                        tracing::info!(%peer_id, "identify sent");
+                    SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Sent { .. })) => {
+                        tracing::debug!("identify sent");
                     }
-                    SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Error { peer_id, error, .. })) => {
-                        tracing::info!(%peer_id, ?error, "identify error");
+                    SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Error { .. })) => {
+                        tracing::debug!("identify error");
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Relay(e)) => {
                         match &e {
-                            relay::Event::ReservationReqAccepted { src_peer_id, .. } => {
-                                tracing::info!(peer = %src_peer_id, "relay: reservation accepted");
+                            relay::Event::ReservationReqAccepted { .. } => {
+                                tracing::debug!("relay: reservation accepted");
                             }
-                            relay::Event::ReservationReqDenied { src_peer_id, status, .. } => {
-                                tracing::warn!(peer = %src_peer_id, ?status, "relay: reservation denied");
+                            relay::Event::ReservationReqDenied { status, .. } => {
+                                tracing::debug!(?status, "relay: reservation denied");
                             }
-                            relay::Event::CircuitReqDenied { src_peer_id, dst_peer_id, status, .. } => {
-                                tracing::warn!(
-                                    src = %src_peer_id,
-                                    dst = %dst_peer_id,
-                                    ?status,
-                                    "relay: circuit denied"
-                                );
+                            relay::Event::CircuitReqDenied { status, .. } => {
+                                tracing::debug!(?status, "relay: circuit denied");
                             }
-                            relay::Event::CircuitReqAccepted { src_peer_id, dst_peer_id, .. } => {
-                                tracing::info!(
-                                    src = %src_peer_id,
-                                    dst = %dst_peer_id,
-                                    "relay: circuit accepted"
-                                );
+                            relay::Event::CircuitReqAccepted { .. } => {
+                                tracing::debug!("relay: circuit accepted");
                             }
                             _ => tracing::debug!(?e, "relay event"),
                         }
@@ -850,14 +844,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         &mut relay_mail_store,
                                         &recipient,
                                         envelopes,
+                                        Some(&mailbox_key),
                                     ) {
-                                        let _ = RelayMailbox::save(&relay_mail_store);
+                                        let _ = RelayMailbox::save(
+                                            &relay_mail_store,
+                                            Some(&mailbox_key),
+                                        );
                                     }
-                                    tracing::info!(
-                                        recipient = %recipient,
-                                        stored = n,
-                                        "relay: stored offline mail"
-                                    );
+                                    tracing::debug!(stored = n, "relay: stored offline mail");
                                     let _ = swarm
                                         .behaviour_mut()
                                         .request_response
@@ -868,11 +862,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         &mut relay_mail_store,
                                         &recipient,
                                         crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
+                                        Some(&mailbox_key),
                                     );
                                     if !envs.is_empty() {
-                                        let _ = RelayMailbox::save(&relay_mail_store);
-                                        tracing::info!(
-                                            recipient = %recipient,
+                                        let _ = RelayMailbox::save(
+                                            &relay_mail_store,
+                                            Some(&mailbox_key),
+                                        );
+                                        tracing::debug!(
                                             count = envs.len(),
                                             "relay: delivering offline mail batch"
                                         );
@@ -893,7 +890,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 } => {
                                     if public_key != [0u8; 32] && !peer_id.is_empty() {
                                         prekey_dir.insert(peer_id.clone(), public_key);
-                                        tracing::info!(peer = %peer_id, "relay: prekey stored");
+                                        tracing::debug!("relay: prekey stored");
                                     }
                                     let _ = swarm
                                         .behaviour_mut()
@@ -903,7 +900,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 V1Packet::PrekeyGet { peer_id } => {
                                     let response = match prekey_dir.get(&peer_id) {
                                         Some(pk) => {
-                                            tracing::info!(peer = %peer_id, "relay: prekey hit");
+                                            tracing::debug!("relay: prekey hit");
                                             V1Packet::PrekeyOffer {
                                                 peer_id: peer_id.clone(),
                                                 public_key: *pk,
@@ -928,8 +925,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                 ) {
                                                     Ok(inner) => {
                                                         let live = swarm.is_connected(&next);
-                                                        tracing::info!(
-                                                            %next,
+                                                        tracing::debug!(
                                                             connected = live,
                                                             "onion: forward"
                                                         );

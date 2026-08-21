@@ -1,21 +1,22 @@
-// In-memory + JSON-persisted storage of known VOID nodes.
+// In-memory + sealed storage of known VOID bootstrap nodes.
 //
-// The list is the only piece of "public" state the bootstrap node keeps;
-// every record is validated (protocol, signature, PeerId = hash(pub))
-// before insertion, so the serialized file only contains already-verified
-// peers. The file itself lives next to bootstrap_peer.key and is world-
-// readable on purpose: its contents are already public after a successful
-// handshake; secrecy of the list isn't a goal. The goal is that an
-// eavesdropper cannot observe exchanges and cannot substitute entries.
+// The file is ChaCha20-Poly1305 (key from bootstrap_peer.key). Hand-editing
+// the blob fails the MAC and the list is dropped. The process still needs
+// the plaintext in RAM; an operator with the identity key can decrypt.
+// Client PeerIds are never stored here — only other seed/bootstrap nodes.
 
 use anyhow::{Context, Result};
+use libp2p::identity;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
+use crate::seal;
 use crate::seed_protocol::SeedEntry;
+
+const NODES_INFO: &[u8] = b"VOID_KNOWN_NODES_v1";
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
 pub struct NodesFile {
@@ -26,25 +27,58 @@ pub struct NodesFile {
 pub struct NodesStore {
     inner: Arc<RwLock<HashMap<String, SeedEntry>>>,
     path: PathBuf,
+    seal_key: [u8; 32],
 }
 
 impl NodesStore {
-    pub async fn load(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn load(path: impl AsRef<Path>, keypair: &identity::Keypair) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let seal_key = seal::seal_key(keypair, NODES_INFO)?;
         let mut map: HashMap<String, SeedEntry> = HashMap::new();
+        let mut migrated = false;
         if path.exists() {
             let bytes = tokio::fs::read(&path).await.with_context(|| {
                 format!("failed to read nodes file {}", path.display())
             })?;
             if !bytes.is_empty() {
-                let file: NodesFile =
-                    serde_json::from_slice(&bytes).context("nodes file json parse")?;
-                for e in file.nodes {
-                    map.insert(e.peer_id_b58.clone(), e);
+                let plain = if seal::is_sealed(&bytes) {
+                    match seal::unseal(&seal_key, &bytes) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            tracing::warn!(
+                                "nodes file MAC/decrypt failed ({e}) — ignoring tampered list"
+                            );
+                            Vec::new()
+                        }
+                    }
+                } else {
+                    migrated = true;
+                    bytes
+                };
+                if !plain.is_empty() {
+                    match serde_json::from_slice::<NodesFile>(&plain) {
+                        Ok(file) => {
+                            for e in file.nodes {
+                                map.insert(e.peer_id_b58.clone(), e);
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("nodes file parse failed ({e}) — starting empty");
+                        }
+                    }
                 }
             }
         }
-        Ok(Self { inner: Arc::new(RwLock::new(map)), path })
+        let store = Self {
+            inner: Arc::new(RwLock::new(map)),
+            path,
+            seal_key,
+        };
+        if migrated {
+            let _ = store.persist().await;
+            tracing::info!("migrated plaintext node list into sealed store");
+        }
+        Ok(store)
     }
 
     pub async fn all(&self) -> Vec<SeedEntry> {
@@ -156,10 +190,12 @@ impl NodesStore {
 
     pub async fn persist(&self) -> Result<()> {
         let file = NodesFile { nodes: self.all().await };
-        let bytes = serde_json::to_vec_pretty(&file)?;
-        let tmp = self.path.with_extension("json.tmp");
-        tokio::fs::write(&tmp, &bytes).await?;
+        let plain = serde_json::to_vec(&file)?;
+        let sealed = seal::seal(&self.seal_key, &plain)?;
+        let tmp = self.path.with_extension("bin.tmp");
+        tokio::fs::write(&tmp, &sealed).await?;
         tokio::fs::rename(&tmp, &self.path).await?;
+        seal::restrict_file_mode(&self.path);
         Ok(())
     }
 }

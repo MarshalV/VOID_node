@@ -40,7 +40,7 @@ pub async fn run(state: Arc<AppState>, bind: String) -> Result<()> {
         let state_cloned = state.clone();
         tokio::spawn(async move {
             if let Err(e) = handle_conn(state_cloned, sock, remote.ip().to_string()).await {
-                tracing::debug!(%remote, ?e, "seed conn ended");
+                tracing::debug!(?e, "seed conn ended");
             }
         });
     }
@@ -60,7 +60,7 @@ async fn handle_conn(
 
     let peer_id_b58 = hs.session.peer_id_b58.clone();
     let mut session = hs.session;
-    tracing::info!(peer = %peer_id_b58, %remote_ip, "inbound seed handshake OK");
+    tracing::debug!("inbound seed handshake OK");
 
     let answer = match hs.request {
         SeedRequest::Exchange { offer, want_max } => {
@@ -73,7 +73,7 @@ async fn handle_conn(
 
             let (added, _total) = state.store.merge(offer, &state.my_peer_id_b58).await;
             if added > 0 {
-                tracing::info!(added, peer = %peer_id_b58, "new seeds learned");
+                tracing::debug!(added, "new seeds learned");
             }
 
             if let Some(adv) = self_announced {
