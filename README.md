@@ -84,7 +84,12 @@ known nodes:  0 (loaded from known_nodes.json)
 | `LISTEN_PORT`| `4001`              | Порт libp2p (TCP + UDP/QUIC).                                                             |
 | `SEED_PORT`  | `4010`              | Порт зашифрованного seed‑протокола.                                                       |
 | `SEED_BIND`  | `0.0.0.0:$SEED_PORT`| Адрес биндинга seed‑сервера.                                                              |
-| `PUBLIC_HOST`| —                   | Ваш публичный IP/домен. Если задан — будет анонсироваться другим. Если пусто — другие узнают ваш адрес из IP вашего исходящего соединения. |
+| `PUBLIC_HOST` | — | Публичный хост/IP для клиентов (опционально; CloudPub/UPnP могут определить сам) |
+| `PUBLIC_LIBP2P_PORT` | — | Внешний TCP-порт libp2p, если не совпадает с `LISTEN_PORT` |
+| `PUBLIC_SEED_PORT` | — | Внешний TCP-порт seed, если не совпадает с `SEED_PORT` |
+| `AUTO_PORT_FORWARD` | `0` | `1` — запросить UPnP-проброс `LISTEN_PORT` и `SEED_PORT` на роутере |
+| `CLOUDPUB_CONFIG` | `~/.config/cloudpub/client.toml` | Путь к конфигу CloudPub (`clo`) |
+| `CLOUDPUB_AUTO_PUBLISH` | `0` | `1` — `clo register tcp …` + `clo run` для libp2p и seed |
 | `RUST_LOG`   | `info`              | Уровень логов tracing.                                                                    |
 
 ## Протокол `/void-seed/v1` — что в проводе

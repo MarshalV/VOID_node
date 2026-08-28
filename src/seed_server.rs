@@ -100,13 +100,12 @@ async fn handle_conn(
 }
 
 /// Build our own SeedEntry describing how others should reach us.
-/// Ports are known from config; host is typically set via the web UI
-/// (because the node itself may not know its public IP behind NAT).
-pub fn build_self_entry(state: &AppState, public_host: &str) -> SeedEntry {
+pub async fn build_self_entry(state: &AppState) -> SeedEntry {
+    let r = state.reach.read().await;
     SeedEntry {
-        host: public_host.to_string(),
-        seed_port: state.seed_port,
-        libp2p_port: state.libp2p_port,
+        host: r.host.clone(),
+        seed_port: r.seed_port,
+        libp2p_port: r.libp2p_port,
         peer_id_b58: state.my_peer_id_b58.clone(),
         last_seen: now_secs(),
     }

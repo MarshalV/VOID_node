@@ -42,7 +42,7 @@ pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<Cont
     // Build our offer: advertise ourselves first, then any fresh peers we know.
     let mut offer: Vec<SeedEntry> = state.store.all().await;
     offer.truncate(128);
-    offer.insert(0, crate::seed_server::build_self_entry(&state, &state.public_host));
+    offer.insert(0, crate::seed_server::build_self_entry(&state).await);
     let sent = offer.len();
 
     let request = SeedRequest::Exchange { offer, want_max: 256 };
@@ -63,7 +63,7 @@ pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<Cont
     let received = peers.len();
 
     // Remember the seed we just talked to (use the host the operator typed).
-    let libp2p_port = state.libp2p_port;
+    let libp2p_port = state.reach.read().await.libp2p_port;
     state
         .store
         .touch(&res.peer_id_b58, host, port, libp2p_port)

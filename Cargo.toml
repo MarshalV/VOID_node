@@ -22,7 +22,7 @@ libp2p = { version = "0.56", features = [
     "macros",
     "ed25519",
 ] }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "sync", "time", "fs"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "net", "io-util", "sync", "time", "fs", "process"] }
 futures = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
@@ -43,6 +43,10 @@ zeroize = { version = "1.7", features = ["derive"] }
 
 # --- utils ---
 anyhow = "1"
+igd-next = "0.14"
+
+[features]
+default = []
 
 [profile.release]
 strip = true

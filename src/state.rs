@@ -1,7 +1,9 @@
 // Shared state used by the seed server, the seed client and main.
 
 use libp2p::identity;
+use tokio::sync::RwLock;
 
+use crate::port_pub::Reachability;
 use crate::storage::NodesStore;
 
 pub struct AppState {
@@ -10,10 +12,8 @@ pub struct AppState {
     pub store: NodesStore,
     pub libp2p_port: u16,
     pub seed_port: u16,
-    /// Public host (IP/DNS) we advertise to other seeds. May be empty
-    /// -- in that case peers learn our address from the TCP source IP
-    /// of our outgoing connections instead.
-    pub public_host: String,
+    /// Public reachability (host + external ports); updated at startup and periodically.
+    pub reach: RwLock<Reachability>,
 }
 
 pub fn now_secs() -> u64 {

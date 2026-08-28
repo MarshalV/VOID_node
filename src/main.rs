@@ -27,6 +27,7 @@ mod i18n;
 mod onion;
 mod relay_mailbox;
 mod seal;
+mod port_pub;
 mod seed_client;
 mod seed_protocol;
 mod seed_server;
@@ -47,6 +48,7 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
+use tracing::info;
 
 use crate::chat_protocol::{OnionHopHint, V1Packet};
 use crate::i18n::Lang;
@@ -462,8 +464,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .unwrap_or(4010);
     let seed_bind: String =
         std::env::var("SEED_BIND").unwrap_or_else(|_| format!("0.0.0.0:{seed_port}"));
-    let public_host: String = std::env::var("PUBLIC_HOST").unwrap_or_default();
 
+    let reach = port_pub::discover(libp2p_port, seed_port).await;
     let store = NodesStore::load(NODES_FILE, &keypair).await?;
     let mailbox_key = crate::seal::seal_key(&keypair, b"VOID_MAILBOX_v1")?;
     let app_state = Arc::new(AppState {
@@ -472,7 +474,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         store,
         libp2p_port,
         seed_port,
-        public_host: public_host.clone(),
+        reach: tokio::sync::RwLock::new(reach),
     });
 
     println!();
@@ -480,8 +482,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     println!("{} {}", lang.peer_id(), local_peer_id);
     println!("{}{} (env LISTEN_PORT)", lang.libp2p_port(), libp2p_port);
     println!("{}{} (env SEED_PORT)", lang.seed_port(), seed_port);
-    if !app_state.public_host.is_empty() {
-        println!("{}{} (env PUBLIC_HOST)", lang.public_host(), app_state.public_host);
+    {
+        let r = app_state.reach.read().await;
+        if !r.host.is_empty() {
+            println!("{}{} (public)", lang.public_host(), r.host);
+        }
+        if r.libp2p_port != libp2p_port || r.seed_port != seed_port {
+            println!(
+                ">>> public ports: libp2p {} seed {} ({})",
+                r.libp2p_port, r.seed_port, r.source
+            );
+        }
     }
     println!(
         "{}",
@@ -663,24 +674,46 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     println!();
     println!("{}", lang.multiaddr_header());
-    println!("  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{}", libp2p_port, local_peer_id);
-    println!("  /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{}", libp2p_port, local_peer_id);
+    {
+        let r = app_state.reach.read().await;
+        if !r.host.is_empty() {
+            let host_part = if r.host.parse::<std::net::Ipv4Addr>().is_ok() {
+                format!("/ip4/{}", r.host)
+            } else if r.host.parse::<std::net::Ipv6Addr>().is_ok() {
+                format!("/ip6/{}", r.host)
+            } else {
+                format!("/dns4/{}", r.host)
+            };
+            println!(
+                "  {}/tcp/{}/p2p/{}",
+                host_part, r.libp2p_port, local_peer_id
+            );
+        } else {
+            println!("  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{}", libp2p_port, local_peer_id);
+            println!(
+                "  /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{}",
+                libp2p_port, local_peer_id
+            );
+        }
+    }
     println!();
     println!("{}", lang.share_seed());
-    println!(
-        "  {}:{}",
-        if app_state.public_host.is_empty() {
-            lang.public_ip_placeholder()
+    {
+        let r = app_state.reach.read().await;
+        let host = if r.host.is_empty() {
+            lang.public_ip_placeholder().to_string()
         } else {
-            app_state.public_host.as_str()
-        },
-        seed_port
-    );
+            r.host.clone()
+        };
+        println!("  {}:{}", host, r.seed_port);
+    }
     println!("{}", lang.ctrl_c());
     println!();
 
     let mut reconnect_tick = tokio::time::interval(Duration::from_secs(30));
     reconnect_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut port_refresh_tick = tokio::time::interval(Duration::from_secs(90));
+    port_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reconnect_state = app_state.clone();
     let mut relay_mail_store = RelayMailbox::load(Some(&mailbox_key));
     if !relay_mail_store.is_empty() {
@@ -698,6 +731,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             _ = signal::ctrl_c() => {
                 println!("{}", lang.stopping());
                 break;
+            }
+            _ = port_refresh_tick.tick() => {
+                let fresh = port_pub::discover(libp2p_port, seed_port).await;
+                let mut w = reconnect_state.reach.write().await;
+                if w.libp2p_port != fresh.libp2p_port
+                    || w.seed_port != fresh.seed_port
+                    || w.host != fresh.host
+                {
+                    info!(
+                        "reachability updated: host={} libp2p={} seed={} ({})",
+                        fresh.host, fresh.libp2p_port, fresh.seed_port, fresh.source
+                    );
+                    *w = fresh;
+                }
             }
             _ = reconnect_tick.tick() => {
                 let connected: std::collections::HashSet<PeerId> =
@@ -749,10 +796,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             remember_onion_peer(&mut onion_dir, peer_id, pk, listen_copy);
                             tracing::debug!("onion: learned hop key");
                             if is_new {
+                                let reach = reconnect_state.reach.read().await;
                                 let self_addrs = advertised_self_addrs(
                                     &listen_addrs,
-                                    &public_host,
-                                    libp2p_port,
+                                    &reach.host,
+                                    reach.libp2p_port,
                                     local_peer_id,
                                 );
                                 let packet = onion_directory_packet(
@@ -779,10 +827,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         } else if !crate::onion::is_bootstrap_agent(&info.agent_version)
                             && onion_gossiped.insert(peer_id)
                         {
+                            let reach = reconnect_state.reach.read().await;
                             let self_addrs = advertised_self_addrs(
                                 &listen_addrs,
-                                &public_host,
-                                libp2p_port,
+                                &reach.host,
+                                reach.libp2p_port,
                                 local_peer_id,
                             );
                             let packet = onion_directory_packet(
@@ -929,10 +978,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                             connected = live,
                                                             "onion: forward"
                                                         );
+                                                        let reach = reconnect_state.reach.read().await;
                                                         let self_addrs = advertised_self_addrs(
                                                             &listen_addrs,
-                                                            &public_host,
-                                                            libp2p_port,
+                                                            &reach.host,
+                                                            reach.libp2p_port,
                                                             local_peer_id,
                                                         );
                                                         onion_try_forward(
