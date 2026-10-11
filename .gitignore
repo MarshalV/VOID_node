@@ -1,4 +1,5 @@
 /target/
+dist/*.deb
 bootstrap_peer.key
 onion.key
 void.lang
