@@ -472,8 +472,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         keypair: keypair.clone(),
         my_peer_id_b58: local_peer_id.to_base58(),
         store,
-        libp2p_port,
-        seed_port,
         reach: tokio::sync::RwLock::new(reach),
     });
 

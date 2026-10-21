@@ -10,8 +10,6 @@ pub struct AppState {
     pub keypair: identity::Keypair,
     pub my_peer_id_b58: String,
     pub store: NodesStore,
-    pub libp2p_port: u16,
-    pub seed_port: u16,
     /// Public reachability (host + external ports); updated at startup and periodically.
     pub reach: RwLock<Reachability>,
 }
