@@ -3,6 +3,7 @@ name = "void-bootstrap-node"
 version = "0.3.0"
 edition = "2021"
 description = "Bootstrap / seed / relay node for VOID P2P messenger DHT + encrypted DNS-Seed exchange"
+license = "MIT"
 
 [dependencies]
 libp2p = { version = "0.56", features = [

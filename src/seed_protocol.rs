@@ -11,7 +11,7 @@
 //   * Perfect Forward Secrecy: ephemeral X25519 keys discarded after
 //     each session
 //   * AEAD: ChaCha20-Poly1305 (RFC 8439)
-//   * KDF: HKDF over Blake2b-512
+//   * KDF: HKDF-SHA-512
 //   * Proof of VOID membership: after the handshake both sides check
 //     protocol_version == "/void/v1" inside the AEAD-protected payload;
 //     a non-VOID peer cannot produce that payload since it cannot
@@ -23,7 +23,7 @@
 //   C -> S : AEAD(k2, n=0, auth_c || request)                  (msg3)
 //   S -> C : AEAD(k2, n=1, response)                           (msg4)
 //
-// k1, k2 = HKDF-Blake2b512( salt = "VOID-SEED/v1" || e_c || e_s,
+// k1, k2 = HKDF-SHA512( salt = "VOID-SEED/v1" || e_c || e_s,
 //                           ikm  = DH(e_c, e_s),
 //                           info = "void-seed-session-keys" ) -> 64 bytes,
 // split into k1 (first 32 bytes) and k2 (next 32 bytes).

@@ -45,6 +45,9 @@ pub(crate) enum V1Packet {
         transport_sig: Vec<u8>,
         #[serde(default)]
         transport_pubkey_pb: Vec<u8>,
+        /// Возможности клиента; нода только пересылает (onion пересобирает пакет).
+        #[serde(default)]
+        caps: u32,
     },
     BootstrapGossip {
         #[serde(default)]

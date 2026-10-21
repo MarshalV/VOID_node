@@ -719,6 +719,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     if !relay_mail_store.is_empty() {
         let _ = RelayMailbox::save(&relay_mail_store, Some(&mailbox_key));
     }
+    let mut store_limits = crate::relay_mailbox::StoreRateLimit::default();
     let mut prekey_dir: HashMap<String, [u8; 32]> = HashMap::new();
     let mut onion_dir: HashMap<PeerId, OnionPeer> = HashMap::new();
     let mut pending_onion: HashMap<PeerId, Vec<V1Packet>> = HashMap::new();
@@ -733,6 +734,14 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 break;
             }
             _ = port_refresh_tick.tick() => {
+                if RelayMailbox::purge_expired(
+                    &mut relay_mail_store,
+                    crate::relay_mailbox::now_secs(),
+                ) {
+                    let _ = RelayMailbox::save(&relay_mail_store, Some(&mailbox_key));
+                    tracing::debug!("relay: expired offline mail purged");
+                }
+                store_limits.forget_idle();
                 let fresh = port_pub::discover(libp2p_port, seed_port).await;
                 let mut w = reconnect_state.reach.write().await;
                 if w.libp2p_port != fresh.libp2p_port
@@ -889,30 +898,62 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     envelopes,
                                 } => {
                                     let n = envelopes.len();
-                                    if RelayMailbox::merge(
-                                        &mut relay_mail_store,
-                                        &recipient,
-                                        envelopes,
-                                        Some(&mailbox_key),
-                                    ) {
-                                        let _ = RelayMailbox::save(
-                                            &relay_mail_store,
+                                    let bytes: usize = envelopes.iter().map(|e| e.ct.len()).sum();
+                                    let accepted = if !store_limits.allow(peer, n, bytes) {
+                                        tracing::debug!("relay: store rate limit hit");
+                                        false
+                                    } else {
+                                        let res = RelayMailbox::merge(
+                                            &mut relay_mail_store,
+                                            &recipient,
+                                            &peer.to_string(),
+                                            envelopes,
                                             Some(&mailbox_key),
+                                            crate::relay_mailbox::now_secs(),
                                         );
-                                    }
-                                    tracing::debug!(stored = n, "relay: stored offline mail");
+                                        if res.changed() {
+                                            let _ = RelayMailbox::save(
+                                                &relay_mail_store,
+                                                Some(&mailbox_key),
+                                            );
+                                        }
+                                        tracing::debug!(
+                                            stored = res.stored,
+                                            rejected = res.rejected,
+                                            "relay: stored offline mail"
+                                        );
+                                        res.rejected == 0
+                                    };
+                                    // Ack = «принято». Отказ (квота / частота) —
+                                    // пустой Deliver: клиент не считает письмо сданным.
+                                    let response = if accepted {
+                                        V1Packet::Ack
+                                    } else {
+                                        V1Packet::OfflineMailboxDeliver { envelopes: Vec::new() }
+                                    };
                                     let _ = swarm
                                         .behaviour_mut()
                                         .request_response
-                                        .send_response(channel, V1Packet::Ack);
+                                        .send_response(channel, response);
                                 }
                                 V1Packet::OfflineMailboxQuery { recipient } => {
-                                    let envs = RelayMailbox::take_batch(
-                                        &mut relay_mail_store,
-                                        &recipient,
-                                        crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
-                                        Some(&mailbox_key),
-                                    );
+                                    // Noise уже доказал, что `peer` владеет ключом своего
+                                    // PeerId: выдаём (и удаляем) только его собственный ящик.
+                                    let own = recipient.parse::<PeerId>().ok() == Some(peer);
+                                    if !own {
+                                        tracing::debug!("relay: mailbox query for foreign recipient denied");
+                                    }
+                                    let envs = if own {
+                                        RelayMailbox::take_batch(
+                                            &mut relay_mail_store,
+                                            &recipient,
+                                            crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
+                                            Some(&mailbox_key),
+                                            crate::relay_mailbox::now_secs(),
+                                        )
+                                    } else {
+                                        Vec::new()
+                                    };
                                     if !envs.is_empty() {
                                         let _ = RelayMailbox::save(
                                             &relay_mail_store,
