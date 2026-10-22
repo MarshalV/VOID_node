@@ -12,10 +12,11 @@
 //     each session
 //   * AEAD: ChaCha20-Poly1305 (RFC 8439)
 //   * KDF: HKDF-SHA-512
-//   * Proof of VOID membership: after the handshake both sides check
-//     protocol_version == "/void/v1" inside the AEAD-protected payload;
-//     a non-VOID peer cannot produce that payload since it cannot
-//     derive the session key without the ephemeral DH.
+//   * Mutual authentication: each side signs
+//     "VOID-SEED/v1|<dir>|e_c||e_s||own PeerId||timestamp" (client also
+//     appends the server PeerId). timestamp is the same field as in AuthPayload.
+//   * protocol_version == "/void/v1" inside AEAD is a version marker, not
+//     access control: any running VOID node binary can produce it.
 //
 // Wire:
 //   C -> S : e_c_pub                                           (msg1)
@@ -153,14 +154,28 @@ pub fn ed25519_from_libp2p(kp: &identity::Keypair) -> Result<(VerifyingKey, Sign
     Ok((vk, sk))
 }
 
-fn sign_context(direction: &str, e_c_pub: &[u8; 32], e_s_pub: &[u8; 32]) -> Vec<u8> {
-    let mut v = Vec::with_capacity(PROTOCOL_VERSION.len() + 2 + direction.len() + 64);
+fn sign_context(
+    direction: &str,
+    e_c_pub: &[u8; 32],
+    e_s_pub: &[u8; 32],
+    signer_peer: &[u8],
+    timestamp: u64,
+    remote_peer: Option<&[u8]>,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(
+        PROTOCOL_VERSION.len() + 2 + direction.len() + 72 + signer_peer.len() + 16,
+    );
     v.extend_from_slice(PROTOCOL_VERSION.as_bytes());
     v.push(b'|');
     v.extend_from_slice(direction.as_bytes());
     v.push(b'|');
     v.extend_from_slice(e_c_pub);
     v.extend_from_slice(e_s_pub);
+    v.extend_from_slice(signer_peer);
+    v.extend_from_slice(&timestamp.to_le_bytes());
+    if let Some(remote) = remote_peer {
+        v.extend_from_slice(remote);
+    }
     v
 }
 
@@ -176,18 +191,28 @@ fn build_auth(
     direction: &str,
     e_c_pub: &[u8; 32],
     e_s_pub: &[u8; 32],
+    remote_peer: Option<&[u8]>,
 ) -> Result<AuthPayload> {
     let (vk, sk) = ed25519_from_libp2p(kp)?;
-    let ctx = sign_context(direction, e_c_pub, e_s_pub);
-    let sig: Signature = sk.sign(&ctx);
     let peer_id = kp.public().to_peer_id();
+    let peer_id_bytes = peer_id.to_bytes();
+    let timestamp = now_secs();
+    let ctx = sign_context(
+        direction,
+        e_c_pub,
+        e_s_pub,
+        &peer_id_bytes,
+        timestamp,
+        remote_peer,
+    );
+    let sig: Signature = sk.sign(&ctx);
     Ok(AuthPayload {
         static_ed_pub: vk.to_bytes(),
-        peer_id_bytes: peer_id.to_bytes(),
+        peer_id_bytes,
         libp2p_pubkey_proto: kp.public().encode_protobuf(),
         protocol_version: VOID_IDENTIFY_VERSION.to_string(),
         agent_version: AGENT_VERSION.to_string(),
-        timestamp: now_secs(),
+        timestamp,
         signature: sig.to_bytes().to_vec(),
     })
 }
@@ -197,6 +222,7 @@ pub fn verify_auth(
     direction: &str,
     e_c_pub: &[u8; 32],
     e_s_pub: &[u8; 32],
+    remote_peer: Option<&[u8]>,
 ) -> Result<String> {
     if auth.protocol_version != VOID_IDENTIFY_VERSION {
         bail!(
@@ -219,7 +245,14 @@ pub fn verify_auth(
         .try_into()
         .map_err(|_| anyhow!("signature length != 64"))?;
     let sig = Signature::from_bytes(&sig_bytes);
-    let ctx = sign_context(direction, e_c_pub, e_s_pub);
+    let ctx = sign_context(
+        direction,
+        e_c_pub,
+        e_s_pub,
+        &auth.peer_id_bytes,
+        auth.timestamp,
+        remote_peer,
+    );
     vk.verify(&ctx, &sig).context("Ed25519 verify failed")?;
 
     let pk = identity::PublicKey::try_decode_protobuf(&auth.libp2p_pubkey_proto)
@@ -305,7 +338,7 @@ where
     let dh = e_s_secret.diffie_hellman(&e_c_pub);
     let (k1, k2) = derive_keys(dh.as_bytes(), &e_c_pub_bytes, &e_s_pub_bytes);
 
-    let auth_s = build_auth(kp, "s", &e_c_pub_bytes, &e_s_pub_bytes)?;
+    let auth_s = build_auth(kp, "s", &e_c_pub_bytes, &e_s_pub_bytes, None)?;
     let auth_s_bytes = bincode::serialize(&auth_s)?;
 
     let cipher1 = ChaCha20Poly1305::new(&k1);
@@ -323,8 +356,15 @@ where
         .decrypt(&nonce(0), Payload { msg: &m3, aad: PROTOCOL_VERSION.as_bytes() })
         .map_err(|e| anyhow!("decrypt msg3 (peer is not a VOID seed or has a different key): {e}"))?;
     let cmsg: ClientMsg = bincode::deserialize(&m3_pt).context("msg3 deserialize")?;
-    let peer_id_b58 = verify_auth(&cmsg.auth, "c", &e_c_pub_bytes, &e_s_pub_bytes)
-        .context("client auth failed")?;
+    let own_peer = kp.public().to_peer_id().to_bytes();
+    let peer_id_b58 = verify_auth(
+        &cmsg.auth,
+        "c",
+        &e_c_pub_bytes,
+        &e_s_pub_bytes,
+        Some(own_peer.as_slice()),
+    )
+    .context("client auth failed")?;
 
     let session = Session {
         key: k2,
@@ -371,10 +411,16 @@ where
         .decrypt(&nonce(0), Payload { msg: ct1, aad: PROTOCOL_VERSION.as_bytes() })
         .map_err(|e| anyhow!("decrypt msg2 (peer is not a VOID seed): {e}"))?;
     let auth_s: AuthPayload = bincode::deserialize(&auth_s_bytes).context("msg2 deserialize")?;
-    let peer_id_b58 = verify_auth(&auth_s, "s", &e_c_pub_bytes, &e_s_pub_bytes)
+    let peer_id_b58 = verify_auth(&auth_s, "s", &e_c_pub_bytes, &e_s_pub_bytes, None)
         .context("server auth failed")?;
 
-    let auth_c = build_auth(kp, "c", &e_c_pub_bytes, &e_s_pub_bytes)?;
+    let auth_c = build_auth(
+        kp,
+        "c",
+        &e_c_pub_bytes,
+        &e_s_pub_bytes,
+        Some(auth_s.peer_id_bytes.as_slice()),
+    )?;
     let cm_bytes = bincode::serialize(&ClientMsg { auth: auth_c, request })?;
 
     let cipher2 = ChaCha20Poly1305::new(&k2);

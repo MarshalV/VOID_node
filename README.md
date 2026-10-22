@@ -1,42 +1,43 @@
-# VOID bootstrap / DNS-Seed узел
+# VOID bootstrap / DNS-Seed node
 
-Версия 0.4 — без веб‑интерфейса. Узел спрашивает точку входа в сеть прямо в
-терминале и дальше работает как:
+Version 0.4 — no web UI. The node asks for a network entry point in the
+terminal, then runs as:
 
-1. **libp2p bootstrap / relay** (`/void/v1` + `/void/kad/1.0.0`) — порты TCP/UDP **4001** по умолчанию.
-2. **Офлайн-почта / prekey** — store-and-forward на `/void/chat/1.0.0` (`relay_mailbox.bin`). Тело `ct` непрозрачно. Файл на диске зашифрован (см. [Офлайн-почта](#офлайн-почта)).
-3. **DNS‑Seed сервер** — отдельный TCP‑порт **4010**, отдаёт другим VOID‑нодам
-   зашифрованный список известных пиров по протоколу `VOID-SEED/v1`.
+1. **libp2p bootstrap / relay** (`/void/v1` + `/void/kad/1.0.0`) — TCP/UDP **4001** by default.
+2. **Offline mail / prekey** — store-and-forward on `/void/chat/1.0.0` (`relay_mailbox.bin`). The `ct` body is opaque. The file on disk is encrypted (see [Offline mail](#offline-mail)).
+3. **DNS-Seed server** — separate TCP port **4010**, hands other VOID nodes
+   an encrypted list of known peers over `VOID-SEED/v1`.
 
-Seed‑обмен между нодами идёт внутри AEAD (Ed25519 + PFS). **Клиентский** libp2p-трафик (Identify, Circuit Relay, mailbox) — другой слой: содержимое чата E2EE, метаданные маршрутизации нода **видит**. Это не anonymous routing и не Tor.
+Seed exchange between nodes is inside AEAD (Ed25519 + PFS). **Client** libp2p traffic (Identify, Circuit Relay, mailbox) is a different layer: chat content is E2EE, routing metadata the node **does see**. This is not anonymous routing and not Tor.
 
-Одна такая нода — штатный режим для VOID (discovery, NAT, relay, mailbox). Она **не** скрывает пару Alice ↔ Bob. Слой анонимной маршрутизации — отдельный план, см. ниже.
+One such node is the normal mode for VOID (discovery, NAT, relay, mailbox). It does **not** hide the Alice ↔ Bob pair. An anonymous-routing layer is a separate plan, see below.
 
 ---
 
-## Требования
+## Requirements
 
 - [Rust](https://rustup.rs/) (stable)
-- Публичный IPv4 (или DNS) и проброс на роутере:
-  - **TCP 4001** и **UDP 4001** — для libp2p,
-  - **TCP 4010** — для seed‑обмена между узлами.
+- Public IPv4 (or DNS) and port forwarding on the router:
+  - **TCP 4001** and **UDP 4001** — libp2p,
+  - **TCP 4010** — seed exchange between nodes.
 
-## Сборка
+## Build
 
-```powershell
-cd C:\Users\banda\Desktop\bootstrap_node
+```bash
+git clone https://github.com/MarshalV/bootstrap_node
+cd bootstrap_node
 cargo build --release
 ```
 
-Бинарник: `target\release\void-bootstrap-node.exe` (на Linux — без `.exe`).
+Binary: `target/release/void-bootstrap-node` (on Windows — `.exe`). On a small VPS, building `libp2p` is often killed by lack of RAM or disk: add swap (~2 GiB), use `cargo build --release -j 1`, and do not keep `target/debug` around at the same time.
 
-## Запуск
+## Run
 
 ```bash
 ./void-bootstrap-node
 ```
 
-При старте появится приглашение:
+On start you get a prompt (English locale shown):
 
 ```
 === VOID bootstrap (seed + relay + DNS-Seed) ===
@@ -45,59 +46,59 @@ libp2p port:  4001 (env LISTEN_PORT)
 seed  port:   4010 (env SEED_PORT)
 known nodes:  0 (loaded from known_nodes.json)
 
-Введите IP[:port] другой VOID-ноды для подключения к сети
-  (Enter -- работать как изолированная сеть; порт по умолчанию 4010):
+Enter IP[:port] of another VOID node to join the network
+  (Enter — isolated network; default port 4010):
 ```
 
-Возможны два сценария.
+Two modes.
 
-### Изолированная сеть
+### Isolated network
 
-Просто нажмите **Enter**. Нода поднимет собственные слушатели и сможет
-обслуживать клиентов VOID и принимать входящие seed‑подключения. Никого сама
-не запрашивает. Это правильный режим для **первого** узла сети.
+Just press **Enter**. The node starts its own listeners and can
+serve VOID clients and accept inbound seed connections. It does not
+dial anyone. This is the right mode for the **first** node in a network.
 
-### Подключение к существующей сети
+### Joining an existing network
 
-Введите адрес другой VOID‑ноды/DNS‑Seed: `198.51.100.10` или `198.51.100.10:4010`,
-или `seed.example.com:4010`. Узел:
+Enter another VOID node / DNS-Seed address: `198.51.100.10` or `198.51.100.10:4010`,
+or `seed.example.com:4010`. The node then:
 
-1. установит TCP‑соединение,
-2. выполнит зашифрованный handshake `VOID-SEED/v1`,
-3. проверит, что удалённая сторона действительно принадлежит сети VOID
-   (подпись `Ed25519` + `protocol_version = "/void/v1"` внутри AEAD),
-4. отдаст ей наш список известных пиров,
-5. получит её список,
-6. сразу попытается подключиться по libp2p ко всем полученным пирам и
-   запустит `kad.bootstrap()` для построения DHT.
+1. opens a TCP connection,
+2. runs the encrypted `VOID-SEED/v1` handshake,
+3. checks that the far side is a VOID node
+   (Ed25519 signature over the ephemeral keys, PeerId, and timestamp),
+4. sends our known-peer list,
+5. receives theirs,
+6. immediately tries libp2p dials to every received peer and
+   runs `kad.bootstrap()` to build the DHT.
 
-Список сохраняется в `known_nodes.json` рядом с бинарником, поэтому при
-следующих запусках узел сразу пытается переподключиться без нового запроса.
+The list is saved in `known_nodes.json` next to the binary, so later
+starts reconnect without asking again.
 
-При первом запуске также создаётся `bootstrap_peer.key` — **берегите его**,
-он определяет ваш `PeerId` и статический Ed25519‑ключ для seed‑протокола.
+The first run also creates `bootstrap_peer.key` — **keep it safe**,
+it is your `PeerId` and the static Ed25519 key for the seed protocol.
 
-### Переменные окружения
+### Environment variables
 
-| Переменная   | По умолчанию        | Описание                                                                                  |
-|--------------|---------------------|-------------------------------------------------------------------------------------------|
-| `LISTEN_PORT`| `4001`              | Порт libp2p (TCP + UDP/QUIC).                                                             |
-| `SEED_PORT`  | `4010`              | Порт зашифрованного seed‑протокола.                                                       |
-| `SEED_BIND`  | `0.0.0.0:$SEED_PORT`| Адрес биндинга seed‑сервера.                                                              |
-| `PUBLIC_HOST` | — | Публичный хост/IP для клиентов (опционально; CloudPub/UPnP могут определить сам) |
-| `PUBLIC_LIBP2P_PORT` | — | Внешний TCP-порт libp2p, если не совпадает с `LISTEN_PORT` |
-| `PUBLIC_SEED_PORT` | — | Внешний TCP-порт seed, если не совпадает с `SEED_PORT` |
-| `AUTO_PORT_FORWARD` | `0` | `1` — запросить UPnP-проброс `LISTEN_PORT` и `SEED_PORT` на роутере |
-| `CLOUDPUB_CONFIG` | `~/.config/cloudpub/client.toml` | Путь к конфигу CloudPub (`clo`) |
-| `CLOUDPUB_AUTO_PUBLISH` | `0` | `1` — `clo register tcp …` + `clo run` для libp2p и seed |
-| `RUST_LOG`   | `info`              | Уровень логов tracing.                                                                    |
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LISTEN_PORT` | `4001` | libp2p port (TCP + UDP/QUIC). |
+| `SEED_PORT` | `4010` | Encrypted seed-protocol port. |
+| `SEED_BIND` | `0.0.0.0:$SEED_PORT` | Seed server bind address. |
+| `PUBLIC_HOST` | — | Public host/IP for clients (optional; CloudPub/UPnP may fill it in) |
+| `PUBLIC_LIBP2P_PORT` | — | External libp2p TCP port if it differs from `LISTEN_PORT` |
+| `PUBLIC_SEED_PORT` | — | External seed TCP port if it differs from `SEED_PORT` |
+| `AUTO_PORT_FORWARD` | `0` | `1` — request UPnP mapping of `LISTEN_PORT` and `SEED_PORT` |
+| `CLOUDPUB_CONFIG` | `~/.config/cloudpub/client.toml` | Path to CloudPub (`clo`) config |
+| `CLOUDPUB_AUTO_PUBLISH` | `0` | `1` — `clo register tcp …` + `clo run` for libp2p and seed |
+| `RUST_LOG` | `info` | tracing log level. |
 
-## Протокол `/void-seed/v1` — что в проводе
+## Protocol `/void-seed/v1` — on the wire
 
 ```
-    Клиент (нода A)                                Сервер (нода B)
+    Client (node A)                                Server (node B)
         |                                               |
-        |  msg1 = e_c_pub (32 случайных байта)          |
+        |  msg1 = e_c_pub (32 random-looking bytes)     |
         | --------------------------------------------> |
         |                                               |
         |  msg2 = e_s_pub || AEAD(k1, n=0, auth_s)      |
@@ -110,107 +111,111 @@ known nodes:  0 (loaded from known_nodes.json)
         | <-------------------------------------------- |
 ```
 
-- Обмен ключами: эфемерные **X25519** (PFS, ключи уничтожаются после сессии).
-- Вывод ключей: `HKDF‑SHA‑512` с `salt = "VOID-SEED/v1" || e_c || e_s` →
-  64 байта, первые 32 — `k1`, вторые 32 — `k2`. Все последующие сообщения
-  шифруются `ChaCha20‑Poly1305` (AEAD, 96‑битный nonce = счётчик, `aad="VOID-SEED/v1"`).
-- Аутентификация: статический `Ed25519` ключ (тот же, что и у libp2p `PeerId`)
-  обеими сторонами подписывает `"VOID-SEED/v1|<dir>|e_c||e_s"`. Внутри
-  шифрованной части передаётся PeerId и `protocol_version = "/void/v1"`.
-- Пассивный наблюдатель видит только 32 «случайных» байта и далее
-  зашифрованный поток. Ни PeerId, ни списка нод, ни идентификатора
-  `/void/v1` в открытом виде нет ни в одном байте.
+- Key exchange: ephemeral **X25519** (PFS, keys discarded after the session).
+- Key derivation: `HKDF-SHA-512` with `salt = "VOID-SEED/v1" || e_c || e_s` →
+  64 bytes, first 32 are `k1`, next 32 are `k2`. All later messages
+  are `ChaCha20-Poly1305` (AEAD, 96-bit nonce = counter, `aad="VOID-SEED/v1"`).
+- Authentication: the static `Ed25519` key (same as the libp2p `PeerId`)
+  on both sides signs `"VOID-SEED/v1|<dir>|e_c||e_s||own PeerId||timestamp"`;
+  the client also appends the server PeerId. Timestamp is checked with a ±5 min window.
+  `protocol_version = "/void/v1"` inside AEAD is a version marker, not access
+  control: any running instance of this program can produce it. An old node
+  will not complete handshake with this signature.
+- A passive observer sees only 32 “random” bytes and then
+  an encrypted stream. Neither PeerId, nor the node list, nor the
+  `/void/v1` marker appears in the clear.
 
-## Подключение обычного клиента VOID
+## Connecting a regular VOID client
 
-Не изменилось — для клиентов VOID нода по‑прежнему корректный libp2p‑seed.
-Строка для `void-bootstrap.txt`:
+Unchanged — for VOID clients this node is still a valid libp2p seed.
+Line for `void-bootstrap.txt`:
 
 ```
-/ip4/<ВАШ_ПУБЛИЧНЫЙ_IP>/tcp/4001/p2p/<PEER_ID>
+/ip4/<YOUR_PUBLIC_IP>/tcp/4001/p2p/<PEER_ID>
 ```
 
-## Запуск в фоне (Windows)
+## Running in the background (Windows)
 
 NSSM:
-- путь к `target\release\void-bootstrap-node.exe`,
-- рабочая папка `C:\Users\banda\Desktop\bootstrap_node`,
-- задайте переменную `PUBLIC_HOST` через панель NSSM, чтобы анонсировать узел.
 
-Режим терминального промпта в NSSM не подходит — запустите один раз вручную,
-введите `Enter` (изолированная сеть) или нужный адрес, и далее регистрируйте
-как сервис уже без подключения, опираясь на сохранённый `known_nodes.json`.
-В сервисном режиме узел просто пропустит интерактивный шаг (если stdin закрыт,
-вернётся пустая строка → изолированный режим, а соединения он восстановит из
+- path to `target\release\void-bootstrap-node.exe`,
+- working directory — the folder with the binary, `bootstrap_peer.key`, and `known_nodes.json`,
+- set `PUBLIC_HOST` in the NSSM panel so the node can advertise itself.
+
+The terminal prompt does not work under NSSM — run once by hand,
+press `Enter` (isolated network) or type the address, then register
+the service without that step, relying on saved `known_nodes.json`.
+In service mode the node skips the interactive step (closed stdin
+returns an empty line → isolated mode, and it restores connections from
 `known_nodes.json`).
 
-## Что видит оператор этой ноды
+## What the operator of this node sees
 
-Клиентский чат **не** форвардится как plaintext (`V1Packet::Encrypted` живого сеанса игнорируется). Circuit Relay пересылает непрозрачные байты. При этом нода — участник маршрута, не «дыра в стене».
+Client chat is **not** forwarded as plaintext (live-session `V1Packet::Encrypted` is ignored). Circuit Relay forwards opaque bytes. The node is still on the path, not a hole in the wall.
 
 ```
 Alice
   │  E2EE
   ▼
-эта нода (Relay / Bootstrap)
+this node (Relay / Bootstrap)
   │
   ▼
 Bob
 ```
 
-На уровне логов (`RUST_LOG=info`, по умолчанию) и состояния нода может сопоставить:
+At `RUST_LOG=info` (the default) and in process state the node can correlate:
 
-| Наблюдение | Откуда |
-|------------|--------|
-| IP клиента + PeerId | `ConnectionEstablished` (`endpoint`) |
+| Observation | Source |
+|-------------|--------|
+| Client IP + PeerId | `ConnectionEstablished` (`endpoint`) |
 | Alice ↔ Bob | `relay: circuit accepted` (`src` / `dst`) |
-| время и объём | длительность соединения, relay bytes |
-| офлайн «кому, когда, сколько» | запросы `OfflineMailboxStore` / `Query` в памяти процесса: PeerId загрузчика и получателя, размер. Конверты v3 клиента не содержат отправителя и типа; у старых клиентов (v2) `sender` / `kind` открыты |
+| time and volume | connection duration, relay bytes |
+| offline “to whom, when, how much” | in-memory `OfflineMailboxStore` / `Query`: uploader and recipient PeerId, size. Client v3 envelopes have no sender or type; old clients (v2) leave `sender` / `kind` in the clear |
 
-E2EE защищает содержимое. Одна нода **не** даёт анонимности маршрутизации: `Alice → Node A → Bob` позволяет Node A связать отправителя и получателя.
+E2EE protects content. One node does **not** give routing anonymity: `Alice → Node A → Bob` lets Node A link sender and recipient.
 
-Несколько копий этой программы у **одного** оператора с точки зрения доверия ≈ одна нода. Важно не число процессов, а независимость операторов.
+Several copies of this program under **one** operator are ≈ one node for trust. What matters is independence of operators, not process count.
 
-## Офлайн-почта
+## Offline mail
 
-`OfflineMailboxStore` кладёт конверт в ящик получателя, `OfflineMailboxQuery` выдаёт порцию и удаляет её.
+`OfflineMailboxStore` puts an envelope in the recipient’s box, `OfflineMailboxQuery` returns a batch and deletes it.
 
-| Правило | Значение |
-|---------|----------|
-| Кто может забрать почту | только сам получатель: `recipient` в `Query` должен совпадать с PeerId соединения (Noise уже доказал владение ключом). Чужой запрос получает пустой ответ, ящик не трогается |
-| Срок жизни конверта | 7 суток с момента приёма, потом удаляется (проверка при приёме, выдаче и раз в 90 с) |
-| Ящик получателя | до 1024 конвертов и 32 МиБ |
-| Один загрузчик в одном ящике | до 256 конвертов и 8 МиБ. Загрузчик — PeerId соединения, на диске хранится только его хэш с ключом ноды |
-| Переполнение ящика | вытесняется самый старый конверт того загрузчика, у которого больше всего байт, — флуд выталкивает сам себя, а не чужие письма |
-| Частота `Store` | на одного пира за минуту: 600 запросов, 600 конвертов, 48 МиБ |
-| Отказ | вместо `Ack` — пустой `OfflineMailboxDeliver`; клиент не считает письмо сданным и повторяет позже |
+| Rule | Value |
+|------|-------|
+| Who can fetch mail | only the recipient: `recipient` in `Query` must match the connection PeerId (Noise already proved key ownership). A foreign query gets an empty reply, the box is untouched |
+| Envelope lifetime | 7 days from accept, then deleted (checked on accept, on deliver, and every 90 s) |
+| Recipient box | up to 1024 envelopes and 32 MiB |
+| One uploader in one box | up to 256 envelopes and 8 MiB. Uploader is the connection PeerId; on disk only its keyed hash is stored |
+| Box overflow | the oldest envelope of the heaviest uploader is evicted — flood pushes itself out, not other people’s mail |
+| `Store` rate | per peer per minute: 600 requests, 600 envelopes, 48 MiB |
+| Refusal | empty `OfflineMailboxDeliver` instead of `Ack`; the client does not treat the letter as handed off and retries later |
 
-`relay_mailbox.bin` зашифрован ChaCha20-Poly1305 ключом из `bootstrap_peer.key` (HKDF, `VOID_MAILBOX_v1`); имена ящиков — хэши PeerId с тем же ключом. Оператор, у которого есть `bootstrap_peer.key`, файл расшифровать может; посторонний, укравший только файл, — нет. Старый формат файла (без срока жизни) читается, срок отсчитывается от первого запуска новой версии.
+`relay_mailbox.bin` is encrypted with ChaCha20-Poly1305, key from `bootstrap_peer.key` (HKDF, `VOID_MAILBOX_v1`); box names are PeerId hashes with the same key. An operator who has `bootstrap_peer.key` can decrypt the file; someone who stole only the file cannot. The old file format (no lifetime) is still readable; lifetime starts at the first run of this version. Clients do not use prekeys on this node for sealing: the offline-mail key is derived from the recipient PeerId.
 
 ## Anonymous routing layer (`VOID_ONION_v1`)
 
-Клиенты VOID оборачивают живой чат (Hello / Encrypted) в onion-ячейки. Эта нода снимает **один** слой своим `onion.key` и форвардит `next` — другой bootstrap или получатель.
+VOID clients wrap live chat (Hello / Encrypted) in onion cells. This node peels **one** layer with its `onion.key` and forwards `next` — another bootstrap or the recipient. The inner packet is re-serialized: `Hello.caps`, `ts`, and `nonce` are **kept**. Without them a new client will reject `Hello` (v2 signature fails), and a session without `caps` stays without header AAD.
 
 ```
-1 нода:  Alice → эта нода → Bob
-2+ нод:  Alice → A → B → [C] → Bob
+1 node:   Alice → this node → Bob
+2+ nodes: Alice → A → B → [C] → Bob
 ```
 
-Ключ анонсируется в Identify: `void-bootstrap-node/0.4;onion=<64 hex>`. Файл `onion.key` рядом с бинарником — не публиковать.
+The key is advertised in Identify: `void-bootstrap-node/0.4;onion=<64 hex>`. File `onion.key` next to the binary — do not publish.
 
-Одна нода по-прежнему коррелирует Alice↔Bob после unwrap. Несколько **независимых** операторов нужны, чтобы entry не знал Bob, а exit — IP Alice. Несколько копий у одного человека ≈ одна нода.
+One node still correlates Alice↔Bob after unwrap. Several **independent** operators are needed so entry does not know Bob and exit does not know Alice’s IP. Several copies under one person ≈ one node.
 
-Circuit Relay v2 и mailbox работают как раньше (NAT, офлайн-почта).
+Circuit Relay v2 and mailbox work as before (NAT, offline mail).
 
-## Безопасность
+## Security
 
-- `bootstrap_peer.key` — статический ключ. Его утечка позволяет выдать себя
-  за вашу ноду в seed‑обмене. Делайте резервные копии и храните в секрете.
-- `known_nodes.json` — публичные адреса. Не критично, но при необходимости
-  можно добавить в `.gitignore`.
-- `relay_mailbox.bin` — офлайн-почта, зашифрована ключом из `bootstrap_peer.key`. Вместе с ключом раскрывает, сколько писем ждёт каждый ящик. Не публиковать и не шарить.
-- `onion.key` — ключ hop'ов VOID_ONION_v1. Утечка позволяет снимать слой этой ноды.
+- `bootstrap_peer.key` — static key. A leak lets someone impersonate
+  your node in seed exchange. Keep backups and keep it secret.
+- `known_nodes.json` — public addresses. Not critical; add to `.gitignore`
+  if you want.
+- `relay_mailbox.bin` — offline mail, encrypted with a key from `bootstrap_peer.key`. Together with the key it shows how many letters wait in each box. Do not publish or share.
+- `onion.key` — VOID_ONION_v1 hop key. A leak lets someone peel this node’s layer.
 
-## Лицензия
+## License
 
-MIT — см. [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).

@@ -48,6 +48,10 @@ pub(crate) enum V1Packet {
         /// Возможности клиента; нода только пересылает (onion пересобирает пакет).
         #[serde(default)]
         caps: u32,
+        #[serde(default)]
+        ts: u64,
+        #[serde(default)]
+        nonce: [u8; 16],
     },
     BootstrapGossip {
         #[serde(default)]
