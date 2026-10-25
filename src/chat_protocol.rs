@@ -32,6 +32,16 @@ pub(crate) struct OnionHopHint {
     pub(crate) pk_hex: String,
     #[serde(default)]
     pub(crate) addrs: Vec<String>,
+    #[serde(default)]
+    pub(crate) sig_hex: String,
+    #[serde(default)]
+    pub(crate) epoch: u64,
+    #[serde(default)]
+    pub(crate) not_after: u64,
+    #[serde(default)]
+    pub(crate) operator: String,
+    #[serde(default)]
+    pub(crate) sig2_hex: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +89,10 @@ pub(crate) enum V1Packet {
         peer_id: String,
         #[serde(default)]
         public_key: [u8; 32],
+        #[serde(default)]
+        not_after: u64,
+        #[serde(default)]
+        sig: Vec<u8>,
     },
     PrekeyGet {
         peer_id: String,
@@ -87,6 +101,10 @@ pub(crate) enum V1Packet {
         peer_id: String,
         #[serde(default)]
         public_key: [u8; 32],
+        #[serde(default)]
+        not_after: u64,
+        #[serde(default)]
+        sig: Vec<u8>,
     },
     Encrypted {
         #[serde(default)]
@@ -105,6 +123,14 @@ pub(crate) enum V1Packet {
     OnionDrop {
         src: String,
         packet: Box<V1Packet>,
+    },
+    Onion2 {
+        #[serde(default)]
+        cell_b64: String,
+    },
+    OnionDeliver {
+        #[serde(default)]
+        body_b64: String,
     },
     Ack,
 }

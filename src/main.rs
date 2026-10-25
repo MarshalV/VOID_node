@@ -24,7 +24,9 @@
 
 mod chat_protocol;
 mod i18n;
+mod kad_store;
 mod onion;
+mod prekey;
 mod relay_mailbox;
 mod seal;
 mod port_pub;
@@ -84,7 +86,7 @@ fn load_or_create_keypair(path: &Path) -> Result<identity::Keypair, Box<dyn Erro
 #[derive(NetworkBehaviour)]
 struct BootBehaviour {
     identify: identify::Behaviour,
-    kad: kad::Behaviour<kad::store::MemoryStore>,
+    kad: kad::Behaviour<kad_store::VoidKadStore>,
     relay: relay::Behaviour,
     autonat: autonat::Behaviour,
     ping: ping::Behaviour,
@@ -248,6 +250,20 @@ fn group_seed_entries(entries: &[SeedEntry]) -> HashMap<PeerId, Vec<Multiaddr>> 
 struct OnionPeer {
     pk: [u8; 32],
     addrs: Vec<Multiaddr>,
+    sig: Option<Vec<u8>>,
+    epoch: u64,
+    not_after: u64,
+    operator: String,
+    sig2: Option<Vec<u8>>,
+}
+
+struct LearnedHop {
+    pk: [u8; 32],
+    sig: Option<Vec<u8>>,
+    epoch: u64,
+    not_after: u64,
+    operator: String,
+    sig2: Option<Vec<u8>>,
 }
 
 const MAX_PENDING_ONION: usize = 16;
@@ -268,14 +284,32 @@ fn addr_is_quic(ma: &Multiaddr) -> bool {
 fn remember_onion_peer(
     dir: &mut HashMap<PeerId, OnionPeer>,
     peer: PeerId,
-    pk: [u8; 32],
+    learned: LearnedHop,
     addrs: impl IntoIterator<Item = Multiaddr>,
 ) {
     let slot = dir.entry(peer).or_insert(OnionPeer {
-        pk,
+        pk: learned.pk,
         addrs: Vec::new(),
+        sig: learned.sig.clone(),
+        epoch: 0,
+        not_after: 0,
+        operator: String::new(),
+        sig2: None,
     });
-    slot.pk = pk;
+    if learned.epoch > 0 && learned.sig2.is_some() {
+        if learned.epoch >= slot.epoch {
+            slot.pk = learned.pk;
+            slot.epoch = learned.epoch;
+            slot.not_after = learned.not_after;
+            slot.operator = learned.operator;
+            slot.sig2 = learned.sig2;
+        }
+    } else if slot.epoch == 0 || slot.pk == learned.pk {
+        slot.pk = learned.pk;
+    }
+    if learned.sig.is_some() {
+        slot.sig = learned.sig;
+    }
     for addr in addrs {
         if addr_is_unspecified(&addr) || addr_is_quic(&addr) {
             continue;
@@ -341,6 +375,11 @@ fn circuit_dial_addrs(relay_tcp: &[Multiaddr], dest: PeerId) -> Vec<Multiaddr> {
 fn onion_directory_packet(
     local: PeerId,
     local_pk: [u8; 32],
+    local_sig: &[u8],
+    local_epoch: u64,
+    local_until: u64,
+    local_op: &str,
+    local_sig2: &[u8],
     self_addrs: &[Multiaddr],
     dir: &HashMap<PeerId, OnionPeer>,
 ) -> V1Packet {
@@ -349,15 +388,32 @@ fn onion_directory_packet(
         peer_id: local.to_string(),
         pk_hex: crate::onion::hex32(&local_pk),
         addrs: self_addrs.iter().map(|a| a.to_string()).collect(),
+        sig_hex: crate::onion::hex_bytes(local_sig),
+        epoch: local_epoch,
+        not_after: local_until,
+        operator: local_op.to_string(),
+        sig2_hex: crate::onion::hex_bytes(local_sig2),
     });
     for (pid, peer) in dir {
         if *pid == local || hints.len() >= MAX_ONION_HINTS {
             continue;
         }
+        let Some(sig) = peer.sig.as_ref() else {
+            continue;
+        };
         hints.push(OnionHopHint {
             peer_id: pid.to_string(),
             pk_hex: crate::onion::hex32(&peer.pk),
             addrs: peer.addrs.iter().map(|a| a.to_string()).collect(),
+            sig_hex: crate::onion::hex_bytes(sig),
+            epoch: peer.epoch,
+            not_after: peer.not_after,
+            operator: peer.operator.clone(),
+            sig2_hex: peer
+                .sig2
+                .as_ref()
+                .map(|s| crate::onion::hex_bytes(s))
+                .unwrap_or_default(),
         });
     }
     let addrs: Vec<String> = hints.iter().flat_map(|h| h.addrs.iter().cloned()).collect();
@@ -379,6 +435,36 @@ fn enqueue_onion(
     q.push(packet);
 }
 
+/// Частота forward: предыдущий hop и общий потолок. 120/мин мало —
+/// средний hop суммирует много клиентов.
+const FORWARD_PER_PREV: u32 = 600;
+const FORWARD_GLOBAL: u32 = 6000;
+
+struct ForwardRateLimit {
+    by_prev: HashMap<PeerId, (std::time::Instant, u32)>,
+    global: (std::time::Instant, u32),
+}
+
+impl ForwardRateLimit {
+    fn allow(&mut self, prev: PeerId) -> bool {
+        let now = std::time::Instant::now();
+        let window = std::time::Duration::from_secs(60);
+        let e = self.by_prev.entry(prev).or_insert((now, 0));
+        if now.duration_since(e.0) >= window {
+            *e = (now, 0);
+        }
+        if now.duration_since(self.global.0) >= window {
+            self.global = (now, 0);
+        }
+        if e.1 >= FORWARD_PER_PREV || self.global.1 >= FORWARD_GLOBAL {
+            return false;
+        }
+        e.1 += 1;
+        self.global.1 += 1;
+        true
+    }
+}
+
 fn onion_try_forward(
     swarm: &mut libp2p::Swarm<BootBehaviour>,
     next: PeerId,
@@ -386,12 +472,19 @@ fn onion_try_forward(
     onion_dir: &HashMap<PeerId, OnionPeer>,
     self_addrs: &[Multiaddr],
     pending: &mut HashMap<PeerId, Vec<V1Packet>>,
+    identified: &std::collections::HashSet<PeerId>,
+    from: PeerId,
+    rate: &mut ForwardRateLimit,
 ) {
     if next == *swarm.local_peer_id() {
         tracing::debug!("onion: skip forward to self");
         return;
     }
-    if swarm.is_connected(&next) {
+    if swarm.is_connected(&next) && identified.contains(&next) {
+        if !rate.allow(from) {
+            tracing::debug!("onion: forward rate");
+            return;
+        }
         let _ = swarm
             .behaviour_mut()
             .request_response
@@ -450,9 +543,29 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let keypair = load_or_create_keypair(Path::new(IDENTITY_FILE))?;
     let local_peer_id = keypair.public().to_peer_id();
-    let onion_sk = crate::onion::load_or_create_sk(Path::new(crate::onion::ONION_KEY_FILE))?;
-    let onion_pk = crate::onion::public_bytes(&onion_sk);
-    let identify_agent = crate::onion::agent_version_with_pk(IDENTIFY_AGENT_VERSION, &onion_pk);
+    let mut onion_mat =
+        crate::onion::OnionMaterial::load(Path::new(crate::onion::ONION_KEY_FILE))?;
+    let mut onion_pk = onion_mat.pk();
+    let mut local_onion_sig =
+        crate::onion::sign_onion_pk(&keypair, local_peer_id, &onion_pk).unwrap_or_default();
+    let mut local_sig2 = keypair
+        .sign(&crate::onion::desc_message(
+            local_peer_id,
+            &onion_pk,
+            onion_mat.epoch,
+            onion_mat.not_after,
+            &onion_mat.operator,
+        ))
+        .unwrap_or_default();
+    let identify_agent = crate::onion::agent_version_v2(
+        IDENTIFY_AGENT_VERSION,
+        &onion_pk,
+        local_peer_id,
+        &keypair,
+        onion_mat.epoch,
+        onion_mat.not_after,
+        &onion_mat.operator,
+    );
 
     let libp2p_port: u16 = std::env::var("LISTEN_PORT")
         .ok()
@@ -527,7 +640,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     .with_push_listen_addr_updates(true),
             );
 
-            let store = kad::store::MemoryStore::new(pid);
+            let store = kad_store::VoidKadStore::new(pid);
             let mut cfg = kad::Config::new(StreamProtocol::new("/void/kad/1.0.0"));
             cfg.set_periodic_bootstrap_interval(Some(Duration::from_secs(5 * 60)));
             cfg.set_query_timeout(Duration::from_secs(15));
@@ -718,9 +831,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         let _ = RelayMailbox::save(&relay_mail_store, Some(&mailbox_key));
     }
     let mut store_limits = crate::relay_mailbox::StoreRateLimit::default();
-    let mut prekey_dir: HashMap<String, [u8; 32]> = HashMap::new();
+    let mut prekey_dir: HashMap<String, crate::prekey::StoredPrekey> = HashMap::new();
+    let mut identified: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+    let mut forward_rate = ForwardRateLimit {
+        by_prev: HashMap::new(),
+        global: (std::time::Instant::now(), 0),
+    };
     let mut onion_dir: HashMap<PeerId, OnionPeer> = HashMap::new();
     let mut pending_onion: HashMap<PeerId, Vec<V1Packet>> = HashMap::new();
+    let mut onion_eph_seen = crate::onion::EphReplay::default();
     let mut listen_addrs: Vec<Multiaddr> = Vec::new();
     let mut onion_gossiped: HashSet<PeerId> = HashSet::new();
     tracing::info!("offline relay mailbox: {} slots on disk", relay_mail_store.len());
@@ -740,6 +859,61 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                     tracing::debug!("relay: expired offline mail purged");
                 }
                 store_limits.forget_idle();
+                if onion_mat
+                    .rotate_if_due(Path::new(crate::onion::ONION_KEY_FILE))
+                    .unwrap_or(false)
+                {
+                    onion_pk = onion_mat.pk();
+                    local_onion_sig = crate::onion::sign_onion_pk(
+                        &reconnect_state.keypair,
+                        local_peer_id,
+                        &onion_pk,
+                    )
+                    .unwrap_or_default();
+                    local_sig2 = reconnect_state
+                        .keypair
+                        .sign(&crate::onion::desc_message(
+                            local_peer_id,
+                            &onion_pk,
+                            onion_mat.epoch,
+                            onion_mat.not_after,
+                            &onion_mat.operator,
+                        ))
+                        .unwrap_or_default();
+                    onion_gossiped.clear();
+                    let reach = reconnect_state.reach.read().await;
+                    let self_addrs = advertised_self_addrs(
+                        &listen_addrs,
+                        &reach.host,
+                        reach.libp2p_port,
+                        local_peer_id,
+                    );
+                    let packet = onion_directory_packet(
+                        local_peer_id,
+                        onion_pk,
+                        &local_onion_sig,
+                        onion_mat.epoch,
+                        onion_mat.not_after,
+                        &onion_mat.operator,
+                        &local_sig2,
+                        &self_addrs,
+                        &onion_dir,
+                    );
+                    drop(reach);
+                    let peers: Vec<PeerId> = swarm
+                        .connected_peers()
+                        .copied()
+                        .filter(|p| *p != local_peer_id)
+                        .collect();
+                    for p in peers {
+                        let _ = swarm
+                            .behaviour_mut()
+                            .request_response
+                            .send_request(&p, packet.clone());
+                        onion_gossiped.insert(p);
+                    }
+                    tracing::info!(epoch = onion_mat.epoch, "onion: hop key rotated");
+                }
                 let fresh = port_pub::discover(libp2p_port, seed_port).await;
                 let mut w = reconnect_state.reach.write().await;
                 if w.libp2p_port != fresh.libp2p_port
@@ -775,18 +949,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                         tracing::info!(%address, "listening");
                     }
-                    SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                    SwarmEvent::ConnectionEstablished { .. } => {
                         tracing::debug!("connection established");
-                        flush_pending_onion(&mut swarm, &mut pending_onion, peer_id);
                     }
                     SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
                         tracing::debug!(remaining = num_established, "connection closed");
                         if num_established == 0 {
                             onion_gossiped.remove(&peer_id);
+                            identified.remove(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         tracing::debug!("identify received");
+                        identified.insert(peer_id);
+                        flush_pending_onion(&mut swarm, &mut pending_onion, peer_id);
                         let listen_copy = info.listen_addrs.clone();
                         for addr in info.listen_addrs {
                             swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
@@ -799,8 +975,37 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             }
                         }
                         if let Some(pk) = crate::onion::parse_pk_from_agent(&info.agent_version) {
+                            let sig = crate::onion::parse_osig_from_agent(&info.agent_version)
+                                .filter(|s| crate::onion::verify_onion_pk_sig(peer_id, &pk, s));
+                            let epoch = crate::onion::parse_epoch_from_agent(&info.agent_version)
+                                .unwrap_or(0);
+                            let not_after = crate::onion::parse_until_from_agent(&info.agent_version)
+                                .unwrap_or(0);
+                            let operator = crate::onion::parse_op_from_agent(&info.agent_version)
+                                .unwrap_or_default();
+                            let now = crate::onion::unix_now();
+                            let sig2 = crate::onion::parse_osig2_from_agent(&info.agent_version)
+                                .filter(|s| {
+                                    crate::onion::desc_fresh(epoch, not_after, now)
+                                        && crate::onion::verify_onion_desc(
+                                            peer_id, &pk, epoch, not_after, &operator, s,
+                                        )
+                                });
+                            let learned_epoch = if sig2.is_some() { epoch } else { 0 };
                             let is_new = !onion_dir.contains_key(&peer_id);
-                            remember_onion_peer(&mut onion_dir, peer_id, pk, listen_copy);
+                            remember_onion_peer(
+                                &mut onion_dir,
+                                peer_id,
+                                LearnedHop {
+                                    pk,
+                                    sig,
+                                    epoch: learned_epoch,
+                                    not_after,
+                                    operator,
+                                    sig2,
+                                },
+                                listen_copy,
+                            );
                             tracing::debug!("onion: learned hop key");
                             if is_new {
                                 let reach = reconnect_state.reach.read().await;
@@ -813,6 +1018,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 let packet = onion_directory_packet(
                                     local_peer_id,
                                     onion_pk,
+                                    &local_onion_sig,
+                                    onion_mat.epoch,
+                                    onion_mat.not_after,
+                                    &onion_mat.operator,
+                                    &local_sig2,
                                     &self_addrs,
                                     &onion_dir,
                                 );
@@ -844,6 +1054,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             let packet = onion_directory_packet(
                                 local_peer_id,
                                 onion_pk,
+                                &local_onion_sig,
+                                onion_mat.epoch,
+                                onion_mat.not_after,
+                                &onion_mat.operator,
+                                &local_sig2,
                                 &self_addrs,
                                 &onion_dir,
                             );
@@ -975,10 +1190,33 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 V1Packet::PrekeyPut {
                                     peer_id,
                                     public_key,
+                                    not_after,
+                                    sig,
                                 } => {
-                                    if public_key != [0u8; 32] && !peer_id.is_empty() {
-                                        prekey_dir.insert(peer_id.clone(), public_key);
+                                    let owner_ok = peer_id.parse::<PeerId>().ok() == Some(peer);
+                                    let now = crate::prekey::unix_now();
+                                    if owner_ok
+                                        && peer_id.parse::<PeerId>().ok().is_some_and(|owner| {
+                                            crate::prekey::verify_prekey_put(
+                                                &owner,
+                                                &public_key,
+                                                not_after,
+                                                &sig,
+                                                now,
+                                            )
+                                        })
+                                    {
+                                        prekey_dir.insert(
+                                            peer_id,
+                                            crate::prekey::StoredPrekey {
+                                                pk: public_key,
+                                                not_after,
+                                                sig,
+                                            },
+                                        );
                                         tracing::debug!("relay: prekey stored");
+                                    } else {
+                                        tracing::debug!("relay: prekey put rejected");
                                     }
                                     let _ = swarm
                                         .behaviour_mut()
@@ -986,18 +1224,20 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         .send_response(channel, V1Packet::Ack);
                                 }
                                 V1Packet::PrekeyGet { peer_id } => {
-                                    let response = match prekey_dir.get(&peer_id) {
-                                        Some(pk) => {
-                                            tracing::debug!("relay: prekey hit");
-                                            V1Packet::PrekeyOffer {
-                                                peer_id: peer_id.clone(),
-                                                public_key: *pk,
-                                            }
+                                    let now = crate::prekey::unix_now();
+                                    let fresh = prekey_dir.get(&peer_id).filter(|p| p.not_after > now);
+                                    let response = if let Some(pk) = fresh {
+                                        tracing::debug!("relay: prekey hit");
+                                        V1Packet::PrekeyOffer {
+                                            peer_id: peer_id.clone(),
+                                            public_key: pk.pk,
+                                            not_after: pk.not_after,
+                                            sig: pk.sig.clone(),
                                         }
-                                        None => {
-                                            tracing::debug!(peer = %peer_id, "relay: prekey miss");
-                                            V1Packet::Ack
-                                        }
+                                    } else {
+                                        prekey_dir.remove(&peer_id);
+                                        tracing::debug!("relay: prekey miss");
+                                        V1Packet::Ack
                                     };
                                     let _ = swarm
                                         .behaviour_mut()
@@ -1005,7 +1245,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         .send_response(channel, response);
                                 }
                                 V1Packet::Onion { eph, nonce, ct } => {
-                                    match crate::onion::open(&onion_sk, &eph, &nonce, &ct) {
+                                    match crate::onion::open_material(&onion_mat, &eph, &nonce, &ct) {
+                                        Ok(payload) if !onion_eph_seen.note(&eph) => {
+                                            tracing::debug!("onion: replayed cell dropped");
+                                        }
                                         Ok(payload) => match payload.next.parse::<PeerId>() {
                                             Ok(next) => {
                                                 match serde_json::from_value::<V1Packet>(
@@ -1031,6 +1274,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                             &onion_dir,
                                                             &self_addrs,
                                                             &mut pending_onion,
+                                                            &identified,
+                                                            peer,
+                                                            &mut forward_rate,
                                                         );
                                                     }
                                                     Err(e) => {
@@ -1043,6 +1289,70 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                             }
                                         },
                                         Err(e) => tracing::debug!("onion: open failed: {e}"),
+                                    }
+                                    let _ = swarm
+                                        .behaviour_mut()
+                                        .request_response
+                                        .send_response(channel, V1Packet::Ack);
+                                }
+                                V1Packet::Onion2 { cell_b64 } => {
+                                    let cell = crate::onion::b64_decode(&cell_b64);
+                                    if let Some(cell) = cell {
+                                        let eph = cell.get(..32).and_then(|s| s.try_into().ok());
+                                        match crate::onion::peel_material(&onion_mat, &cell) {
+                                            Ok(_) if eph.is_some_and(|e| !onion_eph_seen.note(&e)) => {
+                                                tracing::debug!("onion: replayed cell dropped");
+                                            }
+                                            Ok(crate::onion::V2Peel::Forward { next, cell }) => {
+                                                let live = swarm.is_connected(&next);
+                                                tracing::debug!(connected = live, "onion: forward");
+                                                let reach = reconnect_state.reach.read().await;
+                                                let self_addrs = advertised_self_addrs(
+                                                    &listen_addrs,
+                                                    &reach.host,
+                                                    reach.libp2p_port,
+                                                    local_peer_id,
+                                                );
+                                                onion_try_forward(
+                                                    &mut swarm,
+                                                    next,
+                                                    V1Packet::Onion2 {
+                                                        cell_b64: crate::onion::b64_encode(&cell),
+                                                    },
+                                                    &onion_dir,
+                                                    &self_addrs,
+                                                    &mut pending_onion,
+                                                    &identified,
+                                                    peer,
+                                                    &mut forward_rate,
+                                                );
+                                            }
+                                            Ok(crate::onion::V2Peel::Deliver { next, body }) => {
+                                                let live = swarm.is_connected(&next);
+                                                tracing::debug!(connected = live, "onion: forward");
+                                                let reach = reconnect_state.reach.read().await;
+                                                let self_addrs = advertised_self_addrs(
+                                                    &listen_addrs,
+                                                    &reach.host,
+                                                    reach.libp2p_port,
+                                                    local_peer_id,
+                                                );
+                                                onion_try_forward(
+                                                    &mut swarm,
+                                                    next,
+                                                    V1Packet::OnionDeliver {
+                                                        body_b64: crate::onion::b64_encode(&body),
+                                                    },
+                                                    &onion_dir,
+                                                    &self_addrs,
+                                                    &mut pending_onion,
+                                                    &identified,
+                                                    peer,
+                                                    &mut forward_rate,
+                                                );
+                                            }
+                                            Err(e) => tracing::debug!("onion: open failed: {e}"),
+                                        }
                                     }
                                     let _ = swarm
                                         .behaviour_mut()
@@ -1070,11 +1380,48 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         else {
                                             continue;
                                         };
+                                        let Some(sig) =
+                                            crate::onion::parse_hex_bytes(&hint.sig_hex)
+                                        else {
+                                            continue;
+                                        };
+                                        if !crate::onion::verify_onion_pk_sig(pid, &pk, &sig) {
+                                            continue;
+                                        }
                                         let addrs = hint
                                             .addrs
                                             .iter()
                                             .filter_map(|s| s.parse::<Multiaddr>().ok());
-                                        remember_onion_peer(&mut onion_dir, pid, pk, addrs);
+                                        let now = crate::onion::unix_now();
+                                        let sig2 = crate::onion::parse_hex_bytes(&hint.sig2_hex)
+                                            .filter(|s| {
+                                                crate::onion::desc_fresh(
+                                                    hint.epoch,
+                                                    hint.not_after,
+                                                    now,
+                                                ) && crate::onion::verify_onion_desc(
+                                                    pid,
+                                                    &pk,
+                                                    hint.epoch,
+                                                    hint.not_after,
+                                                    &hint.operator,
+                                                    s,
+                                                )
+                                            });
+                                        let learned_epoch = if sig2.is_some() { hint.epoch } else { 0 };
+                                        remember_onion_peer(
+                                            &mut onion_dir,
+                                            pid,
+                                            LearnedHop {
+                                                pk,
+                                                sig: Some(sig),
+                                                epoch: learned_epoch,
+                                                not_after: hint.not_after,
+                                                operator: hint.operator.clone(),
+                                                sig2,
+                                            },
+                                            addrs,
+                                        );
                                     }
                                     let _ = swarm
                                         .behaviour_mut()

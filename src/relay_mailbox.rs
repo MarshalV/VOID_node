@@ -21,6 +21,7 @@ const FILE: &str = "relay_mailbox.bin";
 /// Format marker inside the sealed blob (before it: bincode `RelayData` without TTL).
 const FORMAT_V2: &[u8; 4] = b"VRM2";
 /// Voice ~3MB ~= 128 chunks; allow several pending voice messages.
+const MAX_MAILBOXES: usize = 4096;
 const MAX_PER_RECIPIENT: usize = 1024;
 const MAX_BYTES_PER_RECIPIENT: usize = 32 * 1024 * 1024;
 pub(crate) const MAX_PER_UPLOADER: usize = 256;
@@ -173,8 +174,13 @@ impl RelayMailbox {
         now: u64,
     ) -> MergeResult {
         let mut res = MergeResult::default();
+        let id = slot_id(seal_key, recipient);
+        if !map.contains_key(&id) && map.len() >= MAX_MAILBOXES {
+            res.rejected = envelopes.len();
+            return res;
+        }
         let uploader_id = slot_id(seal_key, &format!("uploader|{uploader}"));
-        let slot = map.entry(slot_id(seal_key, recipient)).or_default();
+        let slot = map.entry(id).or_default();
         slot.retain(|s| now.saturating_sub(s.stored_at) < TTL_SECS);
         let (mut up_count, mut up_bytes) = slot
             .iter()
@@ -201,7 +207,8 @@ impl RelayMailbox {
         }
         evict_over_cap(slot);
         if slot.is_empty() {
-            map.remove(&slot_id(seal_key, recipient));
+            let id = slot_id(seal_key, recipient);
+            map.remove(&id);
         }
         res
     }
@@ -403,6 +410,27 @@ mod tests {
     }
 
     #[test]
+    fn mailbox_ceiling_rejects_a_new_slot() {
+        let mut map = HashMap::new();
+        for i in 0..4096 {
+            let r = RelayMailbox::merge(
+                &mut map,
+                &format!("r{i}"),
+                "alice",
+                vec![env(&format!("m{i}"), 8)],
+                None,
+                1,
+            );
+            assert_eq!(r.stored, 1);
+        }
+        let extra = RelayMailbox::merge(&mut map, "overflow", "alice", vec![env("x", 8)], None, 1);
+        assert_eq!(extra.rejected, 1);
+        assert_eq!(extra.stored, 0);
+        assert_eq!(map.len(), 4096);
+        let again = RelayMailbox::merge(&mut map, "r0", "alice", vec![env("more", 8)], None, 1);
+        assert_eq!(again.stored, 1);
+    }
+
     fn flood_from_many_ids_evicts_flooders_not_real_mail() {
         let mut map = HashMap::new();
         RelayMailbox::merge(&mut map, "bob", "alice", vec![env("real", 1_000)], None, 1);

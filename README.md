@@ -187,23 +187,31 @@ Several copies of this program under **one** operator are ≈ one node for trust
 | Recipient box | up to 1024 envelopes and 32 MiB |
 | One uploader in one box | up to 256 envelopes and 8 MiB. Uploader is the connection PeerId; on disk only its keyed hash is stored |
 | Box overflow | the oldest envelope of the heaviest uploader is evicted — flood pushes itself out, not other people’s mail |
+| Mailbox ceiling | at most 4096 boxes. A new recipient past that is refused; an existing box still accepts mail |
 | `Store` rate | per peer per minute: 600 requests, 600 envelopes, 48 MiB |
 | Refusal | empty `OfflineMailboxDeliver` instead of `Ack`; the client does not treat the letter as handed off and retries later |
+| Prekey | `PrekeyPut` is stored only when the Noise peer is the claimed owner, the signature matches the identity key in that PeerId, and `not_after` is in the future and at most 30 days out. An unsigned or expired put is refused. `PrekeyGet` returns `PrekeyOffer` with `public_key`, `not_after`, and `sig` while the record is unexpired |
 
-`relay_mailbox.bin` is encrypted with ChaCha20-Poly1305, key from `bootstrap_peer.key` (HKDF, `VOID_MAILBOX_v1`); box names are PeerId hashes with the same key. An operator who has `bootstrap_peer.key` can decrypt the file; someone who stole only the file cannot. The old file format (no lifetime) is still readable; lifetime starts at the first run of this version. Clients do not use prekeys on this node for sealing: the offline-mail key is derived from the recipient PeerId.
+`relay_mailbox.bin` is encrypted with ChaCha20-Poly1305, key from `bootstrap_peer.key` (HKDF, `VOID_MAILBOX_v1`); box names are PeerId hashes with the same key. An operator who has `bootstrap_peer.key` can decrypt the file; someone who stole only the file cannot. The old file format (no lifetime) is still readable; lifetime starts at the first run of this version. Clients seal new mail to this prekey. The key derived from the recipient PeerId is only the fallback when no sealable prekey is published.
 
-## Anonymous routing layer (`VOID_ONION_v1`)
+Kademlia `put` on this node keeps two kinds of record and drops the rest: `/void/prekey/<PeerId>` with the owner’s signature and an expiry of at most 30 days, and `/void/mailbox/<PeerId>` as a bincode list of v3 envelopes. Provider records (`start_providing`) are unchanged.
 
-VOID clients wrap live chat (Hello / Encrypted) in onion cells. This node peels **one** layer with its `onion.key` and forwards `next` — another bootstrap or the recipient. The inner packet is re-serialized: `Hello.caps`, `ts`, and `nonce` are **kept**. Without them a new client will reject `Hello` (v2 signature fails), and a session without `caps` stays without header AAD.
+## Onion hop (`VOID_ONION_v1` and `v2`)
+
+VOID clients wrap live chat (Hello / small Encrypted / Ack) in onion cells. This node peels **one** layer and forwards `next` — another bootstrap or the recipient. It does not read the mail. The inner frame is sent only after that hop’s Identify has completed; a connection that is merely established stays queued. `next` must parse as a PeerId and must not be this node. Forwarding is limited to 600 cells per minute from the previous hop and 6000 per minute overall. Logs do not record `next` or `src`.
+
+v1 is the JSON cell. The inner packet is re-serialized: `Hello.caps`, `ts`, and `nonce` are **kept**. New clients sign those three fields; stripping `caps` makes the onion Hello fail. A v1 exit still receives `OnionDrop.src`.
+
+v2 is a fixed cell of 2, 16, or 64 KiB (`Onion2`). This node decrypts slot 0, XORs the body, and either forwards the same-length cell or, on the exit, sends `OnionDeliver` with the opaque body. It does not learn the sender. Both the current secret and the previous one are tried, so a cell sent just before rotation still opens.
 
 ```
 1 node:   Alice → this node → Bob
 2+ nodes: Alice → A → B → [C] → Bob
 ```
 
-The key is advertised in Identify: `void-bootstrap-node/0.4;onion=<64 hex>`. File `onion.key` next to the binary — do not publish.
+The key is advertised in Identify: `void-bootstrap-node/0.4;onion=<64 hex>;osig=<hex>;epoch=<u64>;until=<unix>;op=<label>;osig2=<hex>`. `op` is `VOID_OPERATOR` (up to 32 bytes, no `;`). The public key rotates every 7 days. `onion.key` stores the current secret and the previous one; the previous secret is deleted one day after its `not_after`. A 32-byte `onion.key` from an older build is kept as epoch 1 and given a 7-day expiry, so the advertised key does not jump on the first start. Identify’s agent string is fixed until restart; after a rotation the new descriptor is pushed in `BootstrapGossip`. File `onion.key` next to the binary — do not publish.
 
-One node still correlates Alice↔Bob after unwrap. Several **independent** operators are needed so entry does not know Bob and exit does not know Alice’s IP. Several copies under one person ≈ one node.
+One node still links the two ends: it sees Alice’s IP and Bob’s PeerId. Several **independent** operators are needed before entry and exit are different people. Several copies under one person ≈ one node. Set `VOID_OPERATOR` to a stable label so clients can avoid putting two of your nodes on one path.
 
 Circuit Relay v2 and mailbox work as before (NAT, offline mail).
 
@@ -214,7 +222,7 @@ Circuit Relay v2 and mailbox work as before (NAT, offline mail).
 - `known_nodes.json` — public addresses. Not critical; add to `.gitignore`
   if you want.
 - `relay_mailbox.bin` — offline mail, encrypted with a key from `bootstrap_peer.key`. Together with the key it shows how many letters wait in each box. Do not publish or share.
-- `onion.key` — VOID_ONION_v1 hop key. A leak lets someone peel this node’s layer.
+- `onion.key` — hop key for `VOID_ONION_v1` and `v2`. A leak peels this node’s layer until the secret is erased (current key: 7 days, previous key: one day after that).
 
 ## License
 
