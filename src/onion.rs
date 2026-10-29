@@ -125,12 +125,26 @@ pub fn agent_version_v2(
         }
         out
     };
-    match kp.sign(&desc_message(peer, pk, epoch, not_after, &op)).ok() {
+    let agent = match kp.sign(&desc_message(peer, pk, epoch, not_after, &op)).ok() {
         Some(sig) => format!(
             "{v1};epoch={epoch};until={not_after};op={op};osig2={}",
             hex_bytes(&sig)
         ),
         None => v1,
+    };
+    with_cbor_cap(agent)
+}
+
+/// Нода не шлёт Hello. Тот же бит `HELLO_CAP_CBOR`, что у клиента, — метка в Identify.
+pub fn agent_announces_cbor(agent: &str) -> bool {
+    agent.split(';').any(|p| p.trim() == "cbor=1")
+}
+
+pub fn with_cbor_cap(agent: String) -> String {
+    if agent_announces_cbor(&agent) {
+        agent
+    } else {
+        format!("{agent};cbor=1")
     }
 }
 

@@ -4,7 +4,7 @@ Version 0.4 — no web UI. The node asks for a network entry point in the
 terminal, then runs as:
 
 1. **libp2p bootstrap / relay** (`/void/v1` + `/void/kad/1.0.0`) — TCP/UDP **4001** by default.
-2. **Offline mail / prekey** — store-and-forward on `/void/chat/1.0.0` (`relay_mailbox.bin`). The `ct` body is opaque. The file on disk is encrypted (see [Offline mail](#offline-mail)).
+2. **Offline mail / prekey** — store-and-forward on `/void/chat/1.0.0` (`relay_mailbox.bin`). The frame is JSON or CBOR; the `ct` body is opaque either way. The file on disk is encrypted (see [Offline mail](#offline-mail) and [Chat wire](#chat-wire)).
 3. **DNS-Seed server** — separate TCP port **4010**, hands other VOID nodes
    an encrypted list of known peers over `VOID-SEED/v1`.
 
@@ -189,12 +189,27 @@ Several copies of this program under **one** operator are ≈ one node for trust
 | Box overflow | the oldest envelope of the heaviest uploader is evicted — flood pushes itself out, not other people’s mail |
 | Mailbox ceiling | at most 4096 boxes. A new recipient past that is refused; an existing box still accepts mail |
 | `Store` rate | per peer per minute: 600 requests, 600 envelopes, 48 MiB |
+| One `Store` | at most 64 envelopes; each `ct` at most 256 KiB. A larger field is rejected before it is stored. One `Deliver` is at most 1024 envelopes with the same `ct` cap |
 | Refusal | empty `OfflineMailboxDeliver` instead of `Ack`; the client does not treat the letter as handed off and retries later |
 | Prekey | `PrekeyPut` is stored only when the Noise peer is the claimed owner, the signature matches the identity key in that PeerId, and `not_after` is in the future and at most 30 days out. An unsigned or expired put is refused. `PrekeyGet` returns `PrekeyOffer` with `public_key`, `not_after`, and `sig` while the record is unexpired |
 
 `relay_mailbox.bin` is encrypted with ChaCha20-Poly1305, key from `bootstrap_peer.key` (HKDF, `VOID_MAILBOX_v1`); box names are PeerId hashes with the same key. An operator who has `bootstrap_peer.key` can decrypt the file; someone who stole only the file cannot. The old file format (no lifetime) is still readable; lifetime starts at the first run of this version. Clients seal new mail to this prekey. The key derived from the recipient PeerId is only the fallback when no sealable prekey is published.
 
 Kademlia `put` on this node keeps two kinds of record and drops the rest: `/void/prekey/<PeerId>` with the owner’s signature and an expiry of at most 30 days, and `/void/mailbox/<PeerId>` as a bincode list of v3 envelopes. Provider records (`start_providing`) are unchanged.
+
+## Chat wire
+
+`/void/chat/1.0.0` carries the same `V1Packet` as the client (Hello, mailbox, prekey, onion, `Ack`). Request body at most 4 MiB, response at most 16 MiB.
+
+The node reads JSON and CBOR on every frame:
+
+1. content-type `VC\x01\x01` then JSON, or `VC\x01\x02` then CBOR;
+2. else CBOR magic `d9 d9 f7`, then the CBOR value;
+3. else the first byte: `{`, `[`, `"`, or whitespace is JSON, anything else is CBOR.
+
+`Vec<u8>` (`ct`, `ciphertext`, signatures) is a CBOR byte string. Fixed arrays `[u8; N]` stay arrays of numbers, so a JSON client and the bincode mailbox file still match. A reply uses the encoding of the request.
+
+This process does not send Hello. It announces `HELLO_CAP_CBOR` as `;cbor=1` at the end of the Identify agent string. A current client switches later requests to CBOR after it sees that tag. A client or node without the announcement keeps receiving JSON. Outbound frames this node starts (onion directory, a forwarded cell) are CBOR only when that next peer announced the capability, in its agent tag or in a Hello with bit `2`.
 
 ## Onion hop (`VOID_ONION_v1` and `v2`)
 
@@ -209,7 +224,7 @@ v2 is a fixed cell of 2, 16, or 64 KiB (`Onion2`). This node decrypts slot 0, XO
 2+ nodes: Alice → A → B → [C] → Bob
 ```
 
-The key is advertised in Identify: `void-bootstrap-node/0.4;onion=<64 hex>;osig=<hex>;epoch=<u64>;until=<unix>;op=<label>;osig2=<hex>`. `op` is `VOID_OPERATOR` (up to 32 bytes, no `;`). The public key rotates every 7 days. `onion.key` stores the current secret and the previous one; the previous secret is deleted one day after its `not_after`. A 32-byte `onion.key` from an older build is kept as epoch 1 and given a 7-day expiry, so the advertised key does not jump on the first start. Identify’s agent string is fixed until restart; after a rotation the new descriptor is pushed in `BootstrapGossip`. File `onion.key` next to the binary — do not publish.
+The key is advertised in Identify: `void-bootstrap-node/0.4;onion=<64 hex>;osig=<hex>;epoch=<u64>;until=<unix>;op=<label>;osig2=<hex>;cbor=1`. `op` is `VOID_OPERATOR` (up to 32 bytes, no `;`). `;cbor=1` is always present on this build; older clients ignore the tag and keep sending JSON. The outer chat frame to the next hop is CBOR only if that hop announced the same capability. The v1 cell payload inside the seal stays JSON. The public key rotates every 7 days. `onion.key` stores the current secret and the previous one; the previous secret is deleted one day after its `not_after`. A 32-byte `onion.key` from an older build is kept as epoch 1 and given a 7-day expiry, so the advertised key does not jump on the first start. Identify’s agent string is fixed until restart; after a rotation the new descriptor is pushed in `BootstrapGossip`. File `onion.key` next to the binary — do not publish.
 
 One node still links the two ends: it sees Alice’s IP and Bob’s PeerId. Several **independent** operators are needed before entry and exit are different people. Several copies under one person ≈ one node. Set `VOID_OPERATOR` to a stable label so clients can avoid putting two of your nodes on one path.
 

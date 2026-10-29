@@ -23,6 +23,8 @@
 //!      bootstrap from us in turn.
 
 mod chat_protocol;
+mod rr_codec;
+mod wire;
 mod i18n;
 mod kad_store;
 mod onion;
@@ -91,7 +93,7 @@ struct BootBehaviour {
     autonat: autonat::Behaviour,
     ping: ping::Behaviour,
     /// Store-and-forward офлайн-почты для VOID-клиентов (E2EE-конверты opaque).
-    request_response: libp2p::request_response::json::Behaviour<V1Packet, V1Packet>,
+    request_response: libp2p::request_response::Behaviour<rr_codec::ChatCodec>,
 }
 
 /// Reads one line from stdin without blocking the tokio runtime.
@@ -465,6 +467,37 @@ impl ForwardRateLimit {
     }
 }
 
+fn wire_out(peer: &PeerId, packet: V1Packet, cbor_peers: &HashSet<PeerId>) -> rr_codec::WireMsg {
+    rr_codec::WireMsg {
+        cbor: cbor_peers.contains(peer),
+        packet,
+    }
+}
+
+fn rr_send(
+    swarm: &mut libp2p::Swarm<BootBehaviour>,
+    peer: &PeerId,
+    packet: V1Packet,
+    cbor_peers: &HashSet<PeerId>,
+) -> libp2p::request_response::OutboundRequestId {
+    swarm
+        .behaviour_mut()
+        .request_response
+        .send_request(peer, wire_out(peer, packet, cbor_peers))
+}
+
+fn send_rr_response(
+    swarm: &mut libp2p::Swarm<BootBehaviour>,
+    channel: libp2p::request_response::ResponseChannel<rr_codec::WireMsg>,
+    cbor: bool,
+    packet: V1Packet,
+) {
+    let _ = swarm.behaviour_mut().request_response.send_response(
+        channel,
+        rr_codec::WireMsg { packet, cbor },
+    );
+}
+
 fn onion_try_forward(
     swarm: &mut libp2p::Swarm<BootBehaviour>,
     next: PeerId,
@@ -475,6 +508,7 @@ fn onion_try_forward(
     identified: &std::collections::HashSet<PeerId>,
     from: PeerId,
     rate: &mut ForwardRateLimit,
+    cbor_peers: &HashSet<PeerId>,
 ) {
     if next == *swarm.local_peer_id() {
         tracing::debug!("onion: skip forward to self");
@@ -485,10 +519,7 @@ fn onion_try_forward(
             tracing::debug!("onion: forward rate");
             return;
         }
-        let _ = swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(&next, packet);
+        let _ = rr_send(swarm, &next, packet, cbor_peers);
         return;
     }
     let mut addrs = Vec::new();
@@ -517,15 +548,13 @@ fn flush_pending_onion(
     swarm: &mut libp2p::Swarm<BootBehaviour>,
     pending: &mut HashMap<PeerId, Vec<V1Packet>>,
     peer: PeerId,
+    cbor_peers: &HashSet<PeerId>,
 ) {
     let Some(pkts) = pending.remove(&peer) else {
         return;
     };
     for pkt in pkts {
-        let _ = swarm
-            .behaviour_mut()
-            .request_response
-            .send_request(&peer, pkt);
+        let _ = rr_send(swarm, &peer, pkt, cbor_peers);
     }
 }
 
@@ -675,13 +704,8 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let rr_config = libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(90))
                 .with_max_concurrent_streams(256);
-            let rr_codec =
-                libp2p::request_response::json::codec::Codec::<V1Packet, V1Packet>::default()
-                    .set_request_size_maximum(4 * 1024 * 1024)
-                    .set_response_size_maximum(16 * 1024 * 1024);
-            let request_response = libp2p::request_response::Behaviour::<
-                libp2p::request_response::json::codec::Codec<V1Packet, V1Packet>,
-            >::with_codec(
+            let rr_codec = rr_codec::ChatCodec::new();
+            let request_response = libp2p::request_response::Behaviour::with_codec(
                 rr_codec,
                 [(
                     StreamProtocol::new(CHAT_PROTOCOL),
@@ -833,6 +857,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut store_limits = crate::relay_mailbox::StoreRateLimit::default();
     let mut prekey_dir: HashMap<String, crate::prekey::StoredPrekey> = HashMap::new();
     let mut identified: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+    let mut cbor_peers: HashSet<PeerId> = HashSet::new();
     let mut forward_rate = ForwardRateLimit {
         by_prev: HashMap::new(),
         global: (std::time::Instant::now(), 0),
@@ -906,10 +931,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         .filter(|p| *p != local_peer_id)
                         .collect();
                     for p in peers {
-                        let _ = swarm
-                            .behaviour_mut()
-                            .request_response
-                            .send_request(&p, packet.clone());
+                        let _ = rr_send(&mut swarm, &p, packet.clone(), &cbor_peers);
                         onion_gossiped.insert(p);
                     }
                     tracing::info!(epoch = onion_mat.epoch, "onion: hop key rotated");
@@ -957,12 +979,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         if num_established == 0 {
                             onion_gossiped.remove(&peer_id);
                             identified.remove(&peer_id);
+                            cbor_peers.remove(&peer_id);
                         }
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Received { peer_id, info, .. })) => {
                         tracing::debug!("identify received");
                         identified.insert(peer_id);
-                        flush_pending_onion(&mut swarm, &mut pending_onion, peer_id);
+                        if crate::onion::agent_announces_cbor(&info.agent_version) {
+                            cbor_peers.insert(peer_id);
+                        }
+                        flush_pending_onion(&mut swarm, &mut pending_onion, peer_id, &cbor_peers);
                         let listen_copy = info.listen_addrs.clone();
                         for addr in info.listen_addrs {
                             swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
@@ -1034,10 +1060,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     })
                                     .collect();
                                 for c in clients {
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_request(&c, packet.clone());
+                                    let _ = rr_send(&mut swarm, &c, packet.clone(), &cbor_peers);
                                     onion_gossiped.insert(c);
                                 }
                             }
@@ -1062,10 +1085,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 &self_addrs,
                                 &onion_dir,
                             );
-                            let _ = swarm
-                                .behaviour_mut()
-                                .request_response
-                                .send_request(&peer_id, packet);
+                            let _ = rr_send(&mut swarm, &peer_id, packet, &cbor_peers);
                         }
                     }
                     SwarmEvent::Behaviour(BootBehaviourEvent::Identify(identify::Event::Sent { .. })) => {
@@ -1105,6 +1125,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         if let libp2p::request_response::Message::Request { request, channel, .. } =
                             message
                         {
+                            let inbound_cbor = request.cbor;
+                            let request = request.packet;
+                            if let V1Packet::Hello { caps, .. } = &request {
+                                if caps & wire::HELLO_CAP_CBOR != 0 {
+                                    cbor_peers.insert(peer);
+                                } else {
+                                    cbor_peers.remove(&peer);
+                                }
+                            }
                             match request {
                                 V1Packet::OfflineMailboxStore {
                                     recipient,
@@ -1144,10 +1173,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     } else {
                                         V1Packet::OfflineMailboxDeliver { envelopes: Vec::new() }
                                     };
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, response);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, response);
                                 }
                                 V1Packet::OfflineMailboxQuery { recipient } => {
                                     // Noise уже доказал, что `peer` владеет ключом своего
@@ -1182,10 +1208,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     } else {
                                         V1Packet::OfflineMailboxDeliver { envelopes: envs }
                                     };
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, response);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, response);
                                 }
                                 V1Packet::PrekeyPut {
                                     peer_id,
@@ -1218,10 +1241,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     } else {
                                         tracing::debug!("relay: prekey put rejected");
                                     }
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, V1Packet::Ack);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);
                                 }
                                 V1Packet::PrekeyGet { peer_id } => {
                                     let now = crate::prekey::unix_now();
@@ -1239,10 +1259,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         tracing::debug!("relay: prekey miss");
                                         V1Packet::Ack
                                     };
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, response);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, response);
                                 }
                                 V1Packet::Onion { eph, nonce, ct } => {
                                     match crate::onion::open_material(&onion_mat, &eph, &nonce, &ct) {
@@ -1277,6 +1294,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                             &identified,
                                                             peer,
                                                             &mut forward_rate,
+                                                            &cbor_peers,
                                                         );
                                                     }
                                                     Err(e) => {
@@ -1290,10 +1308,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                         },
                                         Err(e) => tracing::debug!("onion: open failed: {e}"),
                                     }
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, V1Packet::Ack);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);
                                 }
                                 V1Packet::Onion2 { cell_b64 } => {
                                     let cell = crate::onion::b64_decode(&cell_b64);
@@ -1325,6 +1340,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                     &identified,
                                                     peer,
                                                     &mut forward_rate,
+                                                    &cbor_peers,
                                                 );
                                             }
                                             Ok(crate::onion::V2Peel::Deliver { next, body }) => {
@@ -1349,24 +1365,19 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                     &identified,
                                                     peer,
                                                     &mut forward_rate,
+                                                    &cbor_peers,
                                                 );
                                             }
                                             Err(e) => tracing::debug!("onion: open failed: {e}"),
                                         }
                                     }
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, V1Packet::Ack);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);
                                 }
                                 V1Packet::OnionDrop { .. } => {
                                     // Exit hop should have unwrapped to dest; if a drop lands
                                     // here, treat as a client-bound packet we cannot open.
                                     tracing::debug!("onion: OnionDrop on node (ignored)");
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, V1Packet::Ack);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);
                                 }
                                 V1Packet::BootstrapGossip { onion_keys: hints, .. } => {
                                     for hint in hints {
@@ -1423,10 +1434,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                             addrs,
                                         );
                                     }
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, V1Packet::Ack);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);
                                 }
                                 V1Packet::Encrypted { .. } => {
                                     // Live chat is peer-to-peer. Ack here would look like
@@ -1438,10 +1446,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     );
                                 }
                                 _ => {
-                                    let _ = swarm
-                                        .behaviour_mut()
-                                        .request_response
-                                        .send_response(channel, V1Packet::Ack);
+                                    send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);
                                 }
                             }
                         }

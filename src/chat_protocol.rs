@@ -11,6 +11,8 @@ pub(crate) struct OfflineEnvelope {
     pub(crate) kind: String,
     pub(crate) eph: [u8; 32],
     pub(crate) nonce: [u8; 12],
+    /// CBOR: байтовая строка. JSON и bincode ящика — как у `Vec<u8>`.
+    #[serde(with = "serde_bytes")]
     pub(crate) ct: Vec<u8>,
 }
 
@@ -51,11 +53,11 @@ pub(crate) enum V1Packet {
         public_key: [u8; 32],
         #[serde(default)]
         ephemeral_key: [u8; 32],
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         transport_sig: Vec<u8>,
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         transport_pubkey_pb: Vec<u8>,
-        /// Возможности клиента; нода только пересылает (onion пересобирает пакет).
+        /// Возможности клиента (`HELLO_CAP_*`). Бит 2 — CBOR.
         #[serde(default)]
         caps: u32,
         #[serde(default)]
@@ -91,7 +93,7 @@ pub(crate) enum V1Packet {
         public_key: [u8; 32],
         #[serde(default)]
         not_after: u64,
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         sig: Vec<u8>,
     },
     PrekeyGet {
@@ -103,13 +105,13 @@ pub(crate) enum V1Packet {
         public_key: [u8; 32],
         #[serde(default)]
         not_after: u64,
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         sig: Vec<u8>,
     },
     Encrypted {
         #[serde(default)]
         header: MessageHeader,
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         ciphertext: Vec<u8>,
     },
     Onion {
@@ -117,7 +119,7 @@ pub(crate) enum V1Packet {
         eph: [u8; 32],
         #[serde(default)]
         nonce: [u8; 12],
-        #[serde(default)]
+        #[serde(default, with = "serde_bytes")]
         ct: Vec<u8>,
     },
     OnionDrop {
