@@ -364,7 +364,8 @@ pub fn open(
     Ok(serde_json::from_slice(&plain)?)
 }
 
-/// Повтор ячейки на hop'е (С-3): тот же `eph` не форвардим повторно.
+/// Повтор v1-ячейки: тот же `eph`, час, не больше 8192, только RAM.
+/// v2 сюда не пишется. У него `void_onion::OnionReplay` (BLAKE2b-128, 14 суток).
 pub struct EphReplay {
     seen: HashMap<[u8; 32], Instant>,
     order: VecDeque<[u8; 32]>,
@@ -594,6 +595,25 @@ mod tests {
             }
             V2Peel::Forward { .. } => panic!("expected deliver"),
         }
+    }
+
+    #[test]
+    fn v1_eph_cache_is_separate_from_v2_replay() {
+        let mut v1 = EphReplay::default();
+        let eph = [9u8; 32];
+        assert!(v1.note(&eph));
+        assert!(!v1.note(&eph));
+
+        let mut cell = vec![0u8; void_onion::V2_SLOT_LEN];
+        cell[..32].copy_from_slice(&eph);
+        let mut v2 = void_onion::OnionReplay::new();
+        let now = std::time::Instant::now();
+        assert!(!v2.is_replay(&cell, now));
+        v2.note(&cell, now);
+        assert!(v2.is_replay(&cell, now));
+        cell[44] ^= 1;
+        assert!(!v2.is_replay(&cell, now));
+        assert!(!v1.note(&eph));
     }
 
     fn hop_mat(sk: &StaticSecret) -> OnionMaterial {

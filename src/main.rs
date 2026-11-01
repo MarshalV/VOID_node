@@ -1073,6 +1073,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut onion_dir: HashMap<PeerId, OnionPeer> = HashMap::new();
     let mut pending_onion: HashMap<PeerId, Vec<V1Packet>> = HashMap::new();
     let mut onion_eph_seen = crate::onion::EphReplay::default();
+    let mut onion_v2_seen = void_onion::OnionReplay::new();
     let mut listen_addrs: Vec<Multiaddr> = Vec::new();
     let mut onion_gossiped: HashSet<PeerId> = HashSet::new();
     tracing::info!("offline relay mailbox: {} slots on disk", relay_mail.slot_count());
@@ -1469,87 +1470,110 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 V1Packet::Onion2 { cell_b64 } => {
                                     let cell = crate::onion::b64_decode(&cell_b64);
                                     if let Some(cell) = cell {
-                                        let eph = cell.get(..32).and_then(|s| s.try_into().ok());
-                                        match crate::onion::peel_material(&onion_mat, &cell) {
-                                            Ok(_) if eph.is_some_and(|e| !onion_eph_seen.note(&e)) => {
-                                                tracing::debug!("onion: replayed cell dropped");
-                                            }
-                                            Ok(crate::onion::V2Peel::Forward { next, cell }) => {
-                                                let live = swarm.is_connected(&next);
-                                                tracing::debug!(connected = live, "onion: forward");
-                                                let reach = reconnect_state.reach.read().await;
-                                                let self_addrs = advertised_self_addrs(
-                                                    &listen_addrs,
-                                                    &reach.host,
-                                                    reach.libp2p_port,
-                                                    local_peer_id,
-                                                );
-                                                onion_try_forward(
-                                                    &mut swarm,
-                                                    next,
-                                                    V1Packet::Onion2 {
-                                                        cell_b64: crate::onion::b64_encode(&cell),
-                                                    },
-                                                    &onion_dir,
-                                                    &self_addrs,
-                                                    &mut pending_onion,
-                                                    &identified,
-                                                    peer,
-                                                    &mut forward_rate,
-                                                    &cbor_peers,
-                                                    true,
-                                                );
-                                            }
-                                            Ok(crate::onion::V2Peel::Deliver { next, body }) => {
-                                                let reach = reconnect_state.reach.read().await;
-                                                let self_addrs = advertised_self_addrs(
-                                                    &listen_addrs,
-                                                    &reach.host,
-                                                    reach.libp2p_port,
-                                                    local_peer_id,
-                                                );
-                                                if next == local_peer_id {
-                                                    if let Some((hop, cell)) = mailbox_exit_cell(
-                                                        &body,
-                                                        &reconnect_state.keypair,
-                                                        local_peer_id,
-                                                        &mut relay_mail,
-                                                    ) {
-                                                        onion_try_forward(
-                                                            &mut swarm,
-                                                            hop,
-                                                            cell,
-                                                            &onion_dir,
-                                                            &self_addrs,
-                                                            &mut pending_onion,
-                                                            &identified,
-                                                            peer,
-                                                            &mut forward_rate,
-                                                            &cbor_peers,
-                                                            false,
-                                                        );
+                                        let now = std::time::Instant::now();
+                                        if onion_v2_seen.is_replay(&cell, now) {
+                                            tracing::debug!("onion: replayed cell dropped");
+                                        } else {
+                                            match crate::onion::peel_material(&onion_mat, &cell) {
+                                                Ok(peeled) => {
+                                                    onion_v2_seen.note(&cell, now);
+                                                    match peeled {
+                                                        crate::onion::V2Peel::Forward { next, cell } => {
+                                                            let live = swarm.is_connected(&next);
+                                                            tracing::debug!(
+                                                                connected = live,
+                                                                "onion: forward"
+                                                            );
+                                                            let reach =
+                                                                reconnect_state.reach.read().await;
+                                                            let self_addrs = advertised_self_addrs(
+                                                                &listen_addrs,
+                                                                &reach.host,
+                                                                reach.libp2p_port,
+                                                                local_peer_id,
+                                                            );
+                                                            onion_try_forward(
+                                                                &mut swarm,
+                                                                next,
+                                                                V1Packet::Onion2 {
+                                                                    cell_b64: crate::onion::b64_encode(
+                                                                        &cell,
+                                                                    ),
+                                                                },
+                                                                &onion_dir,
+                                                                &self_addrs,
+                                                                &mut pending_onion,
+                                                                &identified,
+                                                                peer,
+                                                                &mut forward_rate,
+                                                                &cbor_peers,
+                                                                true,
+                                                            );
+                                                        }
+                                                        crate::onion::V2Peel::Deliver { next, body } => {
+                                                            let reach =
+                                                                reconnect_state.reach.read().await;
+                                                            let self_addrs = advertised_self_addrs(
+                                                                &listen_addrs,
+                                                                &reach.host,
+                                                                reach.libp2p_port,
+                                                                local_peer_id,
+                                                            );
+                                                            if next == local_peer_id {
+                                                                if let Some((hop, cell)) =
+                                                                    mailbox_exit_cell(
+                                                                        &body,
+                                                                        &reconnect_state.keypair,
+                                                                        local_peer_id,
+                                                                        &mut relay_mail,
+                                                                    )
+                                                                {
+                                                                    onion_try_forward(
+                                                                        &mut swarm,
+                                                                        hop,
+                                                                        cell,
+                                                                        &onion_dir,
+                                                                        &self_addrs,
+                                                                        &mut pending_onion,
+                                                                        &identified,
+                                                                        peer,
+                                                                        &mut forward_rate,
+                                                                        &cbor_peers,
+                                                                        false,
+                                                                    );
+                                                                }
+                                                            } else {
+                                                                let live = swarm.is_connected(&next);
+                                                                tracing::debug!(
+                                                                    connected = live,
+                                                                    "onion: forward"
+                                                                );
+                                                                onion_try_forward(
+                                                                    &mut swarm,
+                                                                    next,
+                                                                    V1Packet::OnionDeliver {
+                                                                        body_b64:
+                                                                            crate::onion::b64_encode(
+                                                                                &body,
+                                                                            ),
+                                                                    },
+                                                                    &onion_dir,
+                                                                    &self_addrs,
+                                                                    &mut pending_onion,
+                                                                    &identified,
+                                                                    peer,
+                                                                    &mut forward_rate,
+                                                                    &cbor_peers,
+                                                                    true,
+                                                                );
+                                                            }
+                                                        }
                                                     }
-                                                } else {
-                                                    let live = swarm.is_connected(&next);
-                                                    tracing::debug!(connected = live, "onion: forward");
-                                                    onion_try_forward(
-                                                        &mut swarm,
-                                                        next,
-                                                        V1Packet::OnionDeliver {
-                                                            body_b64: crate::onion::b64_encode(&body),
-                                                        },
-                                                        &onion_dir,
-                                                        &self_addrs,
-                                                        &mut pending_onion,
-                                                        &identified,
-                                                        peer,
-                                                        &mut forward_rate,
-                                                        &cbor_peers,
-                                                        true,
-                                                    );
+                                                }
+                                                Err(e) => {
+                                                    tracing::debug!("onion: open failed: {e}")
                                                 }
                                             }
-                                            Err(e) => tracing::debug!("onion: open failed: {e}"),
                                         }
                                     }
                                     send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);

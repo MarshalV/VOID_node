@@ -49,11 +49,12 @@ zeroize = { version = "1.7", features = ["derive"] }
 anyhow = "1"
 igd-next = "0.14"
 
-# Same frames, prekey rules, and onion peel as the desktop. No second V1Packet.
-void-frames = { path = "../VOID/p2p-messenger/protocol/void-frames" }
-void-envelope = { path = "../VOID/p2p-messenger/protocol/void-envelope" }
-void-onion = { path = "../VOID/p2p-messenger/protocol/void-onion" }
-void-kad-rules = { path = "../VOID/p2p-messenger/protocol/void-kad-rules" }
+# Same frames, prekey rules, and onion peel as the desktop. Fetched from VOID
+# branch spec so a clone of this repo builds without a sibling checkout.
+void-frames = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
+void-envelope = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
+void-onion = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
+void-kad-rules = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
 
 [features]
 default = []

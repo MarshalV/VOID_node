@@ -29,6 +29,8 @@ cd bootstrap_node
 cargo build --release
 ```
 
+`cargo` fetches `void-frames`, `void-envelope`, `void-onion`, and `void-kad-rules` from [VOID](https://github.com/MarshalV/VOID) branch `spec`. No second checkout next to this repo.
+
 Binary: `target/release/void-bootstrap-node` (on Windows — `.exe`). On a small VPS, building `libp2p` is often killed by lack of RAM or disk: add swap (~2 GiB), use `cargo build --release -j 1`, and do not keep `target/debug` around at the same time.
 
 ## Run
@@ -222,6 +224,8 @@ When `next` is this node, the cell is the mailbox exit. v2 opens the deliver sea
 v1 is the JSON cell. The inner packet is re-serialized: `Hello.caps`, `ts`, and `nonce` are **kept**. New clients sign those three fields; stripping `caps` makes the onion Hello fail.
 
 v2 is a fixed cell of 2, 16, or 64 KiB (`Onion2`). This node decrypts slot 0 and XORs the body. A hop forwards the same-length cell. The exit runs the mailbox, as above, and does not learn the sender from the seal. Both the current secret and the previous one are tried, so a cell sent just before rotation still opens.
+
+A repeat is not forwarded and is not run as the mailbox. v1 remembers the ephemeral key for an hour, at most 8192 keys. v2 uses `OnionReplay`: BLAKE2b-128 of that key and the slot ciphertext, for 14 days. The two caches are separate and stay in memory. A restart forgets both.
 
 ```
 1 node:   Alice → this node → Bob
