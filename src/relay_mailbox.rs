@@ -5,9 +5,9 @@
 //! `void_envelope::queue_mail` (same rules as `QueueDir`). This map is that
 //! directory on disk: one slot table, not a second one beside a PeerId box.
 //!
-//! VRM2 (PeerId slots) is still readable. Those letters drain until the 7-day
-//! TTL. New mail is not written there — the client copy into that slot stops
-//! at step I.5, and a queue slot has no recipient string after decryption.
+//! VRM2 (PeerId slots) stays readable for 7 days. A client with a live queue
+//! grant does not send that copy. A store that still arrives (no grant) is
+//! kept here, without the uploader PeerId. A queue slot has no recipient.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -22,7 +22,8 @@ use void_envelope::queue_mail::{
 };
 
 const FILE: &str = "relay_mailbox.bin";
-/// Previous sealed mailbox: slots keyed by PeerId. Read, do not append.
+/// Previous sealed mailbox: slots keyed by PeerId. Still accepts a store
+/// from a client that has no queue grant.
 const FORMAT_V2: &[u8; 4] = b"VRM2";
 /// Queue slots. Legacy PeerId slots, if any remain, sit in `legacy` until TTL.
 const FORMAT_V3: &[u8; 4] = b"VRM3";
@@ -32,6 +33,9 @@ const MAX_PER_QUEUE: usize = 1024;
 const MAX_BYTES_PER_QUEUE: usize = MAX_PER_QUEUE * (QUEUE_BUCKET as usize);
 /// PeerId slots loaded from VRM2. Same lifetime as the old client DHT record.
 const LEGACY_TTL_SECS: u64 = 7 * 24 * 3600;
+const MAX_LEGACY_SLOTS: usize = 4096;
+const MAX_LEGACY_LETTERS: usize = 1024;
+const MAX_LEGACY_BYTES: usize = 32 * 1024 * 1024;
 /// Batch size for a deliver frame (JSON expands).
 pub(crate) const DELIVER_BATCH_PLAIN_BYTES: usize = 512 * 1024;
 const MAX_OWNER_PK: usize = 4096;
@@ -441,8 +445,50 @@ impl RelayMailbox {
         out
     }
 
+    /// PeerId copy from a client that has no queue grant. The uploader is not stored.
+    pub(crate) fn accept_legacy(
+        &mut self,
+        recipient: &str,
+        envelopes: Vec<OfflineEnvelope>,
+        now: u64,
+    ) -> bool {
+        if recipient.is_empty() || envelopes.is_empty() {
+            return false;
+        }
+        let id = self.legacy_slot(recipient);
+        if !self.legacy.contains_key(&id) && self.legacy.len() >= MAX_LEGACY_SLOTS {
+            return false;
+        }
+        let empty = {
+            let slot = self.legacy.entry(id.clone()).or_default();
+            for env in envelopes {
+                if slot.iter().any(|have| have.env.message_id == env.message_id) {
+                    continue;
+                }
+                slot.push(StoredEnvelope {
+                    env,
+                    stored_at: now,
+                    uploader: String::new(),
+                });
+            }
+            if slot.len() > MAX_LEGACY_LETTERS {
+                let drop = slot.len() - MAX_LEGACY_LETTERS;
+                slot.drain(0..drop);
+            }
+            let mut total: usize = slot.iter().map(|s| envelope_len(&s.env)).sum();
+            while total > MAX_LEGACY_BYTES && !slot.is_empty() {
+                total = total.saturating_sub(envelope_len(&slot.remove(0).env));
+            }
+            slot.is_empty()
+        };
+        if empty {
+            self.legacy.remove(&id);
+            return false;
+        }
+        true
+    }
+
     /// VRM2 slot for `recipient`, only when that string is the TCP peer.
-    /// Does not create a slot and does not accept new letters.
     pub(crate) fn take_legacy(
         &mut self,
         recipient: &str,
@@ -657,6 +703,20 @@ mod tests {
     }
 
     #[test]
+    fn legacy_store_roundtrips_and_does_not_keep_an_uploader() {
+        let now = 1_000u64;
+        let mut mail = RelayMailbox::empty(None);
+        let letter = env("m1");
+        assert!(mail.accept_legacy("bob", vec![letter.clone()], now));
+        assert!(mail.accept_legacy("bob", vec![letter], now));
+        let slot = mail.legacy.get("bob").unwrap();
+        assert_eq!(slot.len(), 1);
+        assert!(slot[0].uploader.is_empty());
+        let got = mail.take_legacy("bob", 1 << 20, now);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].message_id, "m1");
+    }
+
     fn vrm2_peer_slot_drains_and_accepts_nothing_new() {
         let now = 1_000u64;
         let recip = "12D3KooWpeer";

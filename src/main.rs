@@ -568,9 +568,19 @@ fn box_response(
     let now = crate::relay_mailbox::now_secs();
     let batch = crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES;
     match packet {
-        V1Packet::OfflineMailboxStore { .. } => Some(BoxEffect::bare(
-            V1Packet::OfflineMailboxDeliver { envelopes: Vec::new() },
-        )),
+        V1Packet::OfflineMailboxStore {
+            recipient,
+            envelopes,
+        } => {
+            if mail.accept_legacy(&recipient, envelopes, now) {
+                let _ = mail.save();
+                Some(BoxEffect::bare(V1Packet::Ack))
+            } else {
+                Some(BoxEffect::bare(V1Packet::OfflineMailboxDeliver {
+                    envelopes: Vec::new(),
+                }))
+            }
+        }
         V1Packet::OfflineMailboxQuery { recipient, .. } => {
             let own = authed.is_some_and(|id| recipient.parse::<PeerId>().ok() == Some(id));
             if !own {
