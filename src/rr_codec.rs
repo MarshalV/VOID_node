@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use futures::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use libp2p::StreamProtocol;
 
-use crate::chat_protocol::V1Packet;
-use crate::wire::{self, WireEncoding};
+use void_frames::protocol::V1Packet;
+use void_frames::wire::{self, WireEncoding};
 
 #[derive(Debug, Clone)]
 pub struct WireMsg {

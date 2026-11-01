@@ -22,13 +22,11 @@
 //!      VOID-SEED/v1 listener (TCP on SEED_PORT) so other nodes can
 //!      bootstrap from us in turn.
 
-mod chat_protocol;
 mod rr_codec;
-mod wire;
 mod i18n;
 mod kad_store;
+mod node_prekeys;
 mod onion;
-mod prekey;
 mod relay_mailbox;
 mod seal;
 mod port_pub;
@@ -54,7 +52,12 @@ use std::time::Duration;
 use tokio::signal;
 use tracing::info;
 
-use crate::chat_protocol::{OnionHopHint, V1Packet};
+use void_frames::protocol::{
+    decode_v2_mailbox, wrap_mailbox_reply, OnionHopHint, V1Packet, HELLO_CAP_CBOR,
+};
+use void_envelope::offline_mail::OfflineEnvelope;
+use void_envelope::queue_mail;
+use crate::node_prekeys::PrekeyDir;
 use crate::i18n::Lang;
 use crate::relay_mailbox::RelayMailbox;
 use crate::seed_protocol::SeedEntry;
@@ -486,6 +489,30 @@ fn rr_send(
         .send_request(peer, wire_out(peer, packet, cbor_peers))
 }
 
+/// Owner signature stays here. `take_batch` only pops the queue id.
+fn queue_query_ok(
+    mail: &mut RelayMailbox,
+    queue_id: &[u8; 32],
+    ts: u64,
+    nonce: &[u8; 32],
+    sig: &[u8],
+    now: u64,
+) -> bool {
+    if sig.is_empty() || ts.abs_diff(now) > 120 {
+        return false;
+    }
+    let Some(owner_pk) = mail.owner_pk(queue_id, now).map(|pk| pk.to_vec()) else {
+        return false;
+    };
+    if !mail.take_challenge(queue_id, nonce, now) {
+        return false;
+    }
+    let Ok(pk) = identity::PublicKey::try_decode_protobuf(&owner_pk) else {
+        return false;
+    };
+    pk.verify(&queue_mail::query_message(queue_id, ts, nonce), sig)
+}
+
 fn send_rr_response(
     swarm: &mut libp2p::Swarm<BootBehaviour>,
     channel: libp2p::request_response::ResponseChannel<rr_codec::WireMsg>,
@@ -496,6 +523,186 @@ fn send_rr_response(
         channel,
         rr_codec::WireMsg { packet, cbor },
     );
+}
+
+struct BoxEffect {
+    response: V1Packet,
+    restore_queue: Option<([u8; 32], Vec<Vec<u8>>)>,
+    restore_legacy: Option<(String, Vec<OfflineEnvelope>)>,
+}
+
+impl BoxEffect {
+    fn bare(response: V1Packet) -> Self {
+        Self {
+            response,
+            restore_queue: None,
+            restore_legacy: None,
+        }
+    }
+}
+
+fn undo_box(mail: &mut RelayMailbox, effect: BoxEffect) {
+    let now = crate::relay_mailbox::now_secs();
+    let mut changed = false;
+    if let Some((id, blobs)) = effect.restore_queue {
+        mail.restore_queue(&id, blobs, now);
+        changed = true;
+    }
+    if let Some((recipient, envs)) = effect.restore_legacy {
+        mail.restore_legacy(&recipient, envs, now);
+        changed = true;
+    }
+    if changed {
+        let _ = mail.save();
+    }
+}
+
+/// Same mailbox and queue operations as a direct `/void/chat` request.
+/// `authed` is the Noise peer. The onion exit passes `None`: a previous hop
+/// is not the owner, and its PeerId is not charged for the box.
+fn box_response(
+    packet: V1Packet,
+    authed: Option<PeerId>,
+    mail: &mut RelayMailbox,
+) -> Option<BoxEffect> {
+    let now = crate::relay_mailbox::now_secs();
+    let batch = crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES;
+    match packet {
+        V1Packet::OfflineMailboxStore { .. } => Some(BoxEffect::bare(
+            V1Packet::OfflineMailboxDeliver { envelopes: Vec::new() },
+        )),
+        V1Packet::OfflineMailboxQuery { recipient, .. } => {
+            let own = authed.is_some_and(|id| recipient.parse::<PeerId>().ok() == Some(id));
+            if !own {
+                if authed.is_some() {
+                    tracing::debug!("relay: mailbox query for foreign recipient denied");
+                }
+                return Some(BoxEffect::bare(V1Packet::Ack));
+            }
+            let envs = mail.take_legacy(&recipient, batch, now);
+            if envs.is_empty() {
+                return Some(BoxEffect::bare(V1Packet::Ack));
+            }
+            let _ = mail.save();
+            tracing::debug!(count = envs.len(), "relay: delivering legacy mail batch");
+            Some(BoxEffect {
+                response: V1Packet::OfflineMailboxDeliver {
+                    envelopes: envs.clone(),
+                },
+                restore_queue: None,
+                restore_legacy: Some((recipient, envs)),
+            })
+        }
+        V1Packet::CreateQueue {
+            queue_id,
+            owner_pk,
+            write_token,
+            expiry,
+            sig,
+        } => {
+            let ok = mail.create(queue_id, owner_pk, write_token, expiry, &sig, now);
+            if ok {
+                let _ = mail.save();
+            } else {
+                tracing::debug!("relay: queue create rejected");
+            }
+            let response = if ok {
+                V1Packet::Ack
+            } else {
+                V1Packet::QueueDeliver { blobs: Vec::new() }
+            };
+            Some(BoxEffect::bare(response))
+        }
+        V1Packet::QueueStore {
+            queue_id,
+            proof,
+            blob,
+        } => {
+            let accepted = match mail.store(&queue_id, &proof, blob, now) {
+                crate::relay_mailbox::StoreResult::Stored { bucket } => {
+                    let _ = mail.save();
+                    tracing::info!("{}", queue_mail::queue_store_log(&queue_id, bucket));
+                    true
+                }
+                crate::relay_mailbox::StoreResult::Duplicate { .. } => true,
+                crate::relay_mailbox::StoreResult::Rejected => {
+                    tracing::debug!("relay: queue store rejected");
+                    false
+                }
+            };
+            let response = if accepted {
+                V1Packet::Ack
+            } else {
+                V1Packet::QueueDeliver { blobs: Vec::new() }
+            };
+            Some(BoxEffect::bare(response))
+        }
+        V1Packet::QueueChallengeRequest { queue_id } => {
+            let response = match mail.issue_challenge(&queue_id, now) {
+                Some((nonce, ts)) => V1Packet::QueueChallenge { nonce, ts },
+                None => V1Packet::Ack,
+            };
+            Some(BoxEffect::bare(response))
+        }
+        V1Packet::QueueQuery {
+            queue_id,
+            ts,
+            nonce,
+            sig,
+        } => {
+            let blobs = if queue_query_ok(mail, &queue_id, ts, &nonce, &sig, now) {
+                mail.take_batch(&queue_id, batch, now)
+            } else {
+                Vec::new()
+            };
+            if blobs.is_empty() {
+                return Some(BoxEffect::bare(V1Packet::Ack));
+            }
+            let _ = mail.save();
+            Some(BoxEffect {
+                response: V1Packet::QueueDeliver {
+                    blobs: blobs.clone(),
+                },
+                restore_queue: Some((queue_id, blobs)),
+                restore_legacy: None,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Exit: open the deliver seal, run the box frame, wrap the reply on `reply_hops`.
+fn mailbox_exit_cell(
+    body: &[u8],
+    keypair: &identity::Keypair,
+    local: PeerId,
+    mail: &mut RelayMailbox,
+) -> Option<(PeerId, V1Packet)> {
+    let sealed = void_onion::deliver_bytes(body)?;
+    let sk = void_envelope::offline_mail::identity_offline_secret(keypair)?;
+    let plain = void_onion::open_deliver(&sk, sealed).ok()?;
+    let (packet, route) = decode_v2_mailbox(&plain)?;
+    let effect = box_response(packet, None, mail)?;
+    let dest = match route.reply_to {
+        Some(dest) if !route.reply_hops.is_empty() => dest,
+        _ => {
+            undo_box(mail, effect);
+            return None;
+        }
+    };
+    let next = route.reply_hops[0].0;
+    if next == local {
+        undo_box(mail, effect);
+        return None;
+    }
+    match wrap_mailbox_reply(&route.reply_hops, dest, &effect.response, route.token) {
+        Some(cell) => Some((next, cell)),
+        None => {
+            undo_box(mail, effect);
+            tracing::debug!("onion: mailbox reply does not fit");
+            None
+        }
+    }
 }
 
 fn onion_try_forward(
@@ -509,13 +716,14 @@ fn onion_try_forward(
     from: PeerId,
     rate: &mut ForwardRateLimit,
     cbor_peers: &HashSet<PeerId>,
+    count_rate: bool,
 ) {
     if next == *swarm.local_peer_id() {
         tracing::debug!("onion: skip forward to self");
         return;
     }
     if swarm.is_connected(&next) && identified.contains(&next) {
-        if !rate.allow(from) {
+        if count_rate && !rate.allow(from) {
             tracing::debug!("onion: forward rate");
             return;
         }
@@ -610,6 +818,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let reach = port_pub::discover(libp2p_port, seed_port).await;
     let store = NodesStore::load(NODES_FILE, &keypair).await?;
     let mailbox_key = crate::seal::seal_key(&keypair, b"VOID_MAILBOX_v1")?;
+    let prekey_key = crate::seal::seal_key(&keypair, b"VOID_PREKEY_v1")?;
     let app_state = Arc::new(AppState {
         keypair: keypair.clone(),
         my_peer_id_b58: local_peer_id.to_base58(),
@@ -850,12 +1059,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut port_refresh_tick = tokio::time::interval(Duration::from_secs(90));
     port_refresh_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let reconnect_state = app_state.clone();
-    let mut relay_mail_store = RelayMailbox::load(Some(&mailbox_key));
-    if !relay_mail_store.is_empty() {
-        let _ = RelayMailbox::save(&relay_mail_store, Some(&mailbox_key));
+    let mut relay_mail = RelayMailbox::load(Some(&mailbox_key));
+    if !relay_mail.is_empty() {
+        let _ = relay_mail.save();
     }
-    let mut store_limits = crate::relay_mailbox::StoreRateLimit::default();
-    let mut prekey_dir: HashMap<String, crate::prekey::StoredPrekey> = HashMap::new();
+    let mut prekeys = PrekeyDir::load(&prekey_key);
     let mut identified: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
     let mut cbor_peers: HashSet<PeerId> = HashSet::new();
     let mut forward_rate = ForwardRateLimit {
@@ -867,7 +1075,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut onion_eph_seen = crate::onion::EphReplay::default();
     let mut listen_addrs: Vec<Multiaddr> = Vec::new();
     let mut onion_gossiped: HashSet<PeerId> = HashSet::new();
-    tracing::info!("offline relay mailbox: {} slots on disk", relay_mail_store.len());
+    tracing::info!("offline relay mailbox: {} slots on disk", relay_mail.slot_count());
 
     loop {
         tokio::select! {
@@ -876,14 +1084,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 break;
             }
             _ = port_refresh_tick.tick() => {
-                if RelayMailbox::purge_expired(
-                    &mut relay_mail_store,
-                    crate::relay_mailbox::now_secs(),
-                ) {
-                    let _ = RelayMailbox::save(&relay_mail_store, Some(&mailbox_key));
+                if relay_mail.purge_expired(crate::relay_mailbox::now_secs()) {
+                    let _ = relay_mail.save();
                     tracing::debug!("relay: expired offline mail purged");
                 }
-                store_limits.forget_idle();
+                prekeys.purge(void_envelope::offline_mail::prekey_unix_now());
                 if onion_mat
                     .rotate_if_due(Path::new(crate::onion::ONION_KEY_FILE))
                     .unwrap_or(false)
@@ -1128,86 +1333,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                             let inbound_cbor = request.cbor;
                             let request = request.packet;
                             if let V1Packet::Hello { caps, .. } = &request {
-                                if caps & wire::HELLO_CAP_CBOR != 0 {
+                                if caps & HELLO_CAP_CBOR != 0 {
                                     cbor_peers.insert(peer);
                                 } else {
                                     cbor_peers.remove(&peer);
                                 }
                             }
                             match request {
-                                V1Packet::OfflineMailboxStore {
-                                    recipient,
-                                    envelopes,
-                                } => {
-                                    let n = envelopes.len();
-                                    let bytes: usize = envelopes.iter().map(|e| e.ct.len()).sum();
-                                    let accepted = if !store_limits.allow(peer, n, bytes) {
-                                        tracing::debug!("relay: store rate limit hit");
-                                        false
-                                    } else {
-                                        let res = RelayMailbox::merge(
-                                            &mut relay_mail_store,
-                                            &recipient,
-                                            &peer.to_string(),
-                                            envelopes,
-                                            Some(&mailbox_key),
-                                            crate::relay_mailbox::now_secs(),
-                                        );
-                                        if res.changed() {
-                                            let _ = RelayMailbox::save(
-                                                &relay_mail_store,
-                                                Some(&mailbox_key),
-                                            );
-                                        }
-                                        tracing::debug!(
-                                            stored = res.stored,
-                                            rejected = res.rejected,
-                                            "relay: stored offline mail"
-                                        );
-                                        res.rejected == 0
-                                    };
-                                    // Ack = «принято». Отказ (квота / частота) —
-                                    // пустой Deliver: клиент не считает письмо сданным.
-                                    let response = if accepted {
-                                        V1Packet::Ack
-                                    } else {
-                                        V1Packet::OfflineMailboxDeliver { envelopes: Vec::new() }
-                                    };
-                                    send_rr_response(&mut swarm, channel, inbound_cbor, response);
-                                }
-                                V1Packet::OfflineMailboxQuery { recipient } => {
-                                    // Noise уже доказал, что `peer` владеет ключом своего
-                                    // PeerId: выдаём (и удаляем) только его собственный ящик.
-                                    let own = recipient.parse::<PeerId>().ok() == Some(peer);
-                                    if !own {
-                                        tracing::debug!("relay: mailbox query for foreign recipient denied");
-                                    }
-                                    let envs = if own {
-                                        RelayMailbox::take_batch(
-                                            &mut relay_mail_store,
-                                            &recipient,
-                                            crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES,
-                                            Some(&mailbox_key),
-                                            crate::relay_mailbox::now_secs(),
-                                        )
-                                    } else {
-                                        Vec::new()
-                                    };
-                                    if !envs.is_empty() {
-                                        let _ = RelayMailbox::save(
-                                            &relay_mail_store,
-                                            Some(&mailbox_key),
-                                        );
-                                        tracing::debug!(
-                                            count = envs.len(),
-                                            "relay: delivering offline mail batch"
-                                        );
-                                    }
-                                    let response = if envs.is_empty() {
-                                        V1Packet::Ack
-                                    } else {
-                                        V1Packet::OfflineMailboxDeliver { envelopes: envs }
-                                    };
+                                V1Packet::OfflineMailboxStore { .. }
+                                | V1Packet::OfflineMailboxQuery { .. }
+                                | V1Packet::CreateQueue { .. }
+                                | V1Packet::QueueStore { .. }
+                                | V1Packet::QueueChallengeRequest { .. }
+                                | V1Packet::QueueQuery { .. } => {
+                                    let response = box_response(request, Some(peer), &mut relay_mail)
+                                        .map(|effect| effect.response)
+                                        .unwrap_or(V1Packet::Ack);
                                     send_rr_response(&mut swarm, channel, inbound_cbor, response);
                                 }
                                 V1Packet::PrekeyPut {
@@ -1215,28 +1356,22 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     public_key,
                                     not_after,
                                     sig,
+                                    opks,
+                                    kem_ek,
                                 } => {
                                     let owner_ok = peer_id.parse::<PeerId>().ok() == Some(peer);
-                                    let now = crate::prekey::unix_now();
+                                    let now = void_envelope::offline_mail::prekey_unix_now();
                                     if owner_ok
-                                        && peer_id.parse::<PeerId>().ok().is_some_and(|owner| {
-                                            crate::prekey::verify_prekey_put(
-                                                &owner,
-                                                &public_key,
-                                                not_after,
-                                                &sig,
-                                                now,
-                                            )
-                                        })
+                                        && prekeys.put(
+                                            &peer_id,
+                                            public_key,
+                                            not_after,
+                                            sig,
+                                            &kem_ek,
+                                            opks,
+                                            now,
+                                        )
                                     {
-                                        prekey_dir.insert(
-                                            peer_id,
-                                            crate::prekey::StoredPrekey {
-                                                pk: public_key,
-                                                not_after,
-                                                sig,
-                                            },
-                                        );
                                         tracing::debug!("relay: prekey stored");
                                     } else {
                                         tracing::debug!("relay: prekey put rejected");
@@ -1244,18 +1379,18 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     send_rr_response(&mut swarm, channel, inbound_cbor, V1Packet::Ack);
                                 }
                                 V1Packet::PrekeyGet { peer_id } => {
-                                    let now = crate::prekey::unix_now();
-                                    let fresh = prekey_dir.get(&peer_id).filter(|p| p.not_after > now);
-                                    let response = if let Some(pk) = fresh {
+                                    let now = void_envelope::offline_mail::prekey_unix_now();
+                                    let response = if let Some(parts) = prekeys.take(&peer_id, now) {
                                         tracing::debug!("relay: prekey hit");
                                         V1Packet::PrekeyOffer {
-                                            peer_id: peer_id.clone(),
-                                            public_key: pk.pk,
-                                            not_after: pk.not_after,
-                                            sig: pk.sig.clone(),
+                                            peer_id,
+                                            public_key: parts.public_key,
+                                            not_after: parts.not_after,
+                                            sig: parts.sig,
+                                            opk: Some(parts.opk),
+                                            kem_ek: parts.kem_ek,
                                         }
                                     } else {
-                                        prekey_dir.remove(&peer_id);
                                         tracing::debug!("relay: prekey miss");
                                         V1Packet::Ack
                                     };
@@ -1263,7 +1398,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                 }
                                 V1Packet::Onion { eph, nonce, ct } => {
                                     match crate::onion::open_material(&onion_mat, &eph, &nonce, &ct) {
-                                        Ok(payload) if !onion_eph_seen.note(&eph) => {
+                                        Ok(_payload) if !onion_eph_seen.note(&eph) => {
                                             tracing::debug!("onion: replayed cell dropped");
                                         }
                                         Ok(payload) => match payload.next.parse::<PeerId>() {
@@ -1272,11 +1407,6 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                     payload.inner,
                                                 ) {
                                                     Ok(inner) => {
-                                                        let live = swarm.is_connected(&next);
-                                                        tracing::debug!(
-                                                            connected = live,
-                                                            "onion: forward"
-                                                        );
                                                         let reach = reconnect_state.reach.read().await;
                                                         let self_addrs = advertised_self_addrs(
                                                             &listen_addrs,
@@ -1284,18 +1414,44 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                             reach.libp2p_port,
                                                             local_peer_id,
                                                         );
-                                                        onion_try_forward(
-                                                            &mut swarm,
-                                                            next,
-                                                            inner,
-                                                            &onion_dir,
-                                                            &self_addrs,
-                                                            &mut pending_onion,
-                                                            &identified,
-                                                            peer,
-                                                            &mut forward_rate,
-                                                            &cbor_peers,
-                                                        );
+                                                        if next == local_peer_id {
+                                                            match inner {
+                                                                V1Packet::OnionDrop { .. } => {
+                                                                    tracing::debug!(
+                                                                        "onion: OnionDrop on exit (ignored)"
+                                                                    );
+                                                                }
+                                                                other => {
+                                                                    if let Some(effect) = box_response(
+                                                                        other,
+                                                                        None,
+                                                                        &mut relay_mail,
+                                                                    ) {
+                                                                        // v1 cell has no return path in the seal.
+                                                                        undo_box(&mut relay_mail, effect);
+                                                                    }
+                                                                }
+                                                            }
+                                                        } else {
+                                                            let live = swarm.is_connected(&next);
+                                                            tracing::debug!(
+                                                                connected = live,
+                                                                "onion: forward"
+                                                            );
+                                                            onion_try_forward(
+                                                                &mut swarm,
+                                                                next,
+                                                                inner,
+                                                                &onion_dir,
+                                                                &self_addrs,
+                                                                &mut pending_onion,
+                                                                &identified,
+                                                                peer,
+                                                                &mut forward_rate,
+                                                                &cbor_peers,
+                                                                true,
+                                                            );
+                                                        }
                                                     }
                                                     Err(e) => {
                                                         tracing::warn!("onion: inner decode: {e}")
@@ -1341,11 +1497,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                     peer,
                                                     &mut forward_rate,
                                                     &cbor_peers,
+                                                    true,
                                                 );
                                             }
                                             Ok(crate::onion::V2Peel::Deliver { next, body }) => {
-                                                let live = swarm.is_connected(&next);
-                                                tracing::debug!(connected = live, "onion: forward");
                                                 let reach = reconnect_state.reach.read().await;
                                                 let self_addrs = advertised_self_addrs(
                                                     &listen_addrs,
@@ -1353,20 +1508,46 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                                     reach.libp2p_port,
                                                     local_peer_id,
                                                 );
-                                                onion_try_forward(
-                                                    &mut swarm,
-                                                    next,
-                                                    V1Packet::OnionDeliver {
-                                                        body_b64: crate::onion::b64_encode(&body),
-                                                    },
-                                                    &onion_dir,
-                                                    &self_addrs,
-                                                    &mut pending_onion,
-                                                    &identified,
-                                                    peer,
-                                                    &mut forward_rate,
-                                                    &cbor_peers,
-                                                );
+                                                if next == local_peer_id {
+                                                    if let Some((hop, cell)) = mailbox_exit_cell(
+                                                        &body,
+                                                        &reconnect_state.keypair,
+                                                        local_peer_id,
+                                                        &mut relay_mail,
+                                                    ) {
+                                                        onion_try_forward(
+                                                            &mut swarm,
+                                                            hop,
+                                                            cell,
+                                                            &onion_dir,
+                                                            &self_addrs,
+                                                            &mut pending_onion,
+                                                            &identified,
+                                                            peer,
+                                                            &mut forward_rate,
+                                                            &cbor_peers,
+                                                            false,
+                                                        );
+                                                    }
+                                                } else {
+                                                    let live = swarm.is_connected(&next);
+                                                    tracing::debug!(connected = live, "onion: forward");
+                                                    onion_try_forward(
+                                                        &mut swarm,
+                                                        next,
+                                                        V1Packet::OnionDeliver {
+                                                            body_b64: crate::onion::b64_encode(&body),
+                                                        },
+                                                        &onion_dir,
+                                                        &self_addrs,
+                                                        &mut pending_onion,
+                                                        &identified,
+                                                        peer,
+                                                        &mut forward_rate,
+                                                        &cbor_peers,
+                                                        true,
+                                                    );
+                                                }
                                             }
                                             Err(e) => tracing::debug!("onion: open failed: {e}"),
                                         }

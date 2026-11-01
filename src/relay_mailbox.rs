@@ -1,38 +1,43 @@
-//! Store-and-forward relay for offline mail (persisted on disk, sealed).
+//! Sealed store-and-forward mailbox.
 //!
-//! Limits:
-//! - an envelope lives at most [`TTL_SECS`] (7 days, same as the client DHT record);
-//! - one uploader (the Noise-authenticated peer that sent `OfflineMailboxStore`)
-//!   may hold at most [`MAX_PER_UPLOADER`] envelopes / [`MAX_BYTES_PER_UPLOADER`]
-//!   in one recipient's box;
-//! - when the box is over its total cap, the envelope evicted is the oldest one of
-//!   the uploader holding the most bytes, so a flood pushes out the flooder first.
+//! A queue slot is [`crate::seal::mailbox_slot`] of the queue id (32 bytes, hex),
+//! not a PeerId. Create, the write proof, and the query bytes are
+//! `void_envelope::queue_mail` (same rules as `QueueDir`). This map is that
+//! directory on disk: one slot table, not a second one beside a PeerId box.
+//!
+//! VRM2 (PeerId slots) is still readable. Those letters drain until the 7-day
+//! TTL. New mail is not written there — the client copy into that slot stops
+//! at step I.5, and a queue slot has no recipient string after decryption.
 
 use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rand::RngCore;
 use serde::{Deserialize, Serialize};
-
-use crate::chat_protocol::OfflineEnvelope;
+use void_envelope::offline_mail::OfflineEnvelope;
+use void_envelope::queue_mail::{
+    self, verify_create, write_proof, QUEUE_BUCKET, QUEUE_TTL_SECS,
+};
 
 const FILE: &str = "relay_mailbox.bin";
-/// Format marker inside the sealed blob (before it: bincode `RelayData` without TTL).
+/// Previous sealed mailbox: slots keyed by PeerId. Read, do not append.
 const FORMAT_V2: &[u8; 4] = b"VRM2";
-/// Voice ~3MB ~= 128 chunks; allow several pending voice messages.
-const MAX_MAILBOXES: usize = 4096;
-const MAX_PER_RECIPIENT: usize = 1024;
-const MAX_BYTES_PER_RECIPIENT: usize = 32 * 1024 * 1024;
-pub(crate) const MAX_PER_UPLOADER: usize = 256;
-pub(crate) const MAX_BYTES_PER_UPLOADER: usize = 8 * 1024 * 1024;
-pub(crate) const TTL_SECS: u64 = 7 * 24 * 3600;
-/// Batch size for OfflineMailboxDeliver (JSON expands ~3x).
-pub(crate) const DELIVER_BATCH_PLAIN_BYTES: usize = 512 * 1024;
+/// Queue slots. Legacy PeerId slots, if any remain, sit in `legacy` until TTL.
+const FORMAT_V3: &[u8; 4] = b"VRM3";
 
-fn envelope_len(env: &OfflineEnvelope) -> usize {
-    env.ct.len() + 96
-}
+const MAX_QUEUES: usize = 4096;
+const MAX_PER_QUEUE: usize = 1024;
+const MAX_BYTES_PER_QUEUE: usize = MAX_PER_QUEUE * (QUEUE_BUCKET as usize);
+/// PeerId slots loaded from VRM2. Same lifetime as the old client DHT record.
+const LEGACY_TTL_SECS: u64 = 7 * 24 * 3600;
+/// Batch size for a deliver frame (JSON expands).
+pub(crate) const DELIVER_BATCH_PLAIN_BYTES: usize = 512 * 1024;
+const MAX_OWNER_PK: usize = 4096;
+const MAX_SIG: usize = 256;
+const CHALLENGE_TTL_SECS: u64 = 120;
+const MAX_CHALLENGES: usize = 64;
 
 pub(crate) fn now_secs() -> u64 {
     SystemTime::now()
@@ -42,19 +47,40 @@ pub(crate) fn now_secs() -> u64 {
 }
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct StoredEnvelope {
-    pub(crate) env: OfflineEnvelope,
-    pub(crate) stored_at: u64,
-    /// Keyed hash of the uploader PeerId (empty for mail stored before quotas).
-    pub(crate) uploader: String,
+struct StoredEnvelope {
+    env: OfflineEnvelope,
+    stored_at: u64,
+    /// Keyed hash of the uploader. Present only in VRM2 leftovers.
+    #[serde(default)]
+    uploader: String,
 }
 
-pub(crate) type MailboxMap = HashMap<String, Vec<StoredEnvelope>>;
+#[derive(Clone, Serialize, Deserialize)]
+struct QueueDisk {
+    owner_pk: Vec<u8>,
+    write_token: [u8; 32],
+    expiry: u64,
+    letters: Vec<LetterDisk>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct LetterDisk {
+    blob: Vec<u8>,
+    stored_at: u64,
+}
 
 #[derive(Default, Serialize, Deserialize)]
-struct RelayData {
+struct RelayFileV3 {
     #[serde(default)]
-    by_recipient: MailboxMap,
+    queues: HashMap<String, QueueDisk>,
+    #[serde(default)]
+    legacy: HashMap<String, Vec<StoredEnvelope>>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct RelayDataV2 {
+    #[serde(default)]
+    by_recipient: HashMap<String, Vec<StoredEnvelope>>,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -63,54 +89,92 @@ struct LegacyRelayData {
     by_recipient: HashMap<String, Vec<OfflineEnvelope>>,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct MergeResult {
-    pub(crate) stored: usize,
-    pub(crate) duplicate: usize,
-    pub(crate) rejected: usize,
+struct QueueSlot {
+    owner_pk: Vec<u8>,
+    write_token: [u8; 32],
+    expiry: u64,
+    letters: Vec<LetterDisk>,
 }
 
-impl MergeResult {
-    pub(crate) fn changed(&self) -> bool {
-        self.stored > 0
-    }
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StoreResult {
+    Stored { bucket: u32 },
+    Duplicate { bucket: u32 },
+    Rejected,
 }
 
-pub(crate) struct RelayMailbox;
+pub(crate) struct RelayMailbox {
+    seal_key: Option<[u8; 32]>,
+    queues: HashMap<String, QueueSlot>,
+    legacy: HashMap<String, Vec<StoredEnvelope>>,
+    challenges: HashMap<[u8; 32], HashMap<[u8; 32], u64>>,
+}
 
 impl RelayMailbox {
-    pub(crate) fn load(seal_key: Option<&[u8; 32]>) -> MailboxMap {
+    pub(crate) fn load(seal_key: Option<&[u8; 32]>) -> Self {
+        let mut mail = Self::empty(seal_key);
         if !Path::new(FILE).exists() {
-            return HashMap::new();
+            return mail;
         }
         let Ok(bytes) = std::fs::read(FILE) else {
-            return HashMap::new();
+            return mail;
         };
-        let plain = match seal_key {
+        let plain = match mail.seal_key.as_ref() {
             Some(key) if crate::seal::is_sealed(&bytes) => match crate::seal::unseal(key, &bytes) {
                 Ok(p) => p,
                 Err(_) => {
                     tracing::warn!("mailbox MAC failed — ignoring tampered mailbox");
-                    return HashMap::new();
+                    return mail;
                 }
             },
             _ => bytes,
         };
-        let now = now_secs();
-        let mut map = if let Some(body) = plain.strip_prefix(FORMAT_V2.as_slice()) {
-            bincode::deserialize::<RelayData>(body)
-                .map(|d| d.by_recipient)
-                .unwrap_or_default()
-        } else {
-            let legacy = bincode::deserialize::<LegacyRelayData>(&plain)
-                .or_else(|_| serde_json::from_slice::<LegacyRelayData>(&plain))
+        mail.ingest(&plain, now_secs());
+        mail
+    }
+
+    fn empty(seal_key: Option<&[u8; 32]>) -> Self {
+        Self {
+            seal_key: seal_key.copied(),
+            queues: HashMap::new(),
+            legacy: HashMap::new(),
+            challenges: HashMap::new(),
+        }
+    }
+
+    fn ingest(&mut self, plain: &[u8], now: u64) {
+        if let Some(body) = plain.strip_prefix(FORMAT_V3.as_slice()) {
+            let file = bincode::deserialize::<RelayFileV3>(body).unwrap_or_default();
+            self.queues = file
+                .queues
+                .into_iter()
+                .map(|(slot, disk)| {
+                    (
+                        slot,
+                        QueueSlot {
+                            owner_pk: disk.owner_pk,
+                            write_token: disk.write_token,
+                            expiry: disk.expiry,
+                            letters: disk.letters,
+                        },
+                    )
+                })
+                .collect();
+            self.legacy = file.legacy;
+        } else if let Some(body) = plain.strip_prefix(FORMAT_V2.as_slice()) {
+            self.legacy = bincode::deserialize::<RelayDataV2>(body)
                 .map(|d| d.by_recipient)
                 .unwrap_or_default();
-            let legacy = match seal_key {
+        } else {
+            let legacy = bincode::deserialize::<LegacyRelayData>(plain)
+                .or_else(|_| serde_json::from_slice::<LegacyRelayData>(plain))
+                .map(|d| d.by_recipient)
+                .unwrap_or_default();
+            let legacy = match self.seal_key.as_ref() {
                 Some(key) => remap_slots(legacy, key),
                 None => legacy,
             };
-            legacy
+            self.legacy = legacy
                 .into_iter()
                 .map(|(slot, envs)| {
                     let stored = envs
@@ -123,22 +187,33 @@ impl RelayMailbox {
                         .collect();
                     (slot, stored)
                 })
-                .collect()
-        };
-        Self::purge_expired(&mut map, now);
-        map
+                .collect();
+        }
+        self.purge_expired(now);
     }
 
-    pub(crate) fn save(
-        map: &MailboxMap,
-        seal_key: Option<&[u8; 32]>,
-    ) -> Result<(), Box<dyn Error>> {
-        let data = RelayData {
-            by_recipient: map.clone(),
+    pub(crate) fn save(&self) -> Result<(), Box<dyn Error>> {
+        let data = RelayFileV3 {
+            queues: self
+                .queues
+                .iter()
+                .map(|(slot, q)| {
+                    (
+                        slot.clone(),
+                        QueueDisk {
+                            owner_pk: q.owner_pk.clone(),
+                            write_token: q.write_token,
+                            expiry: q.expiry,
+                            letters: q.letters.clone(),
+                        },
+                    )
+                })
+                .collect(),
+            legacy: self.legacy.clone(),
         };
-        let mut bytes = FORMAT_V2.to_vec();
+        let mut bytes = FORMAT_V3.to_vec();
         bytes.extend_from_slice(&bincode::serialize(&data)?);
-        if let Some(key) = seal_key {
+        if let Some(key) = self.seal_key.as_ref() {
             bytes = crate::seal::seal(key, &bytes)?;
         }
         std::fs::write(format!("{FILE}.tmp"), &bytes)?;
@@ -147,87 +222,238 @@ impl RelayMailbox {
             let _ = std::fs::rename(FILE, format!("{FILE}.bak"));
         }
         std::fs::rename(format!("{FILE}.tmp"), FILE)?;
-        if seal_key.is_some() {
+        if self.seal_key.is_some() {
             crate::seal::restrict_file_mode(Path::new(FILE));
         }
         Ok(())
     }
 
-    /// Drop envelopes older than [`TTL_SECS`]. Returns true if anything was removed.
-    pub(crate) fn purge_expired(map: &mut MailboxMap, now: u64) -> bool {
+    pub(crate) fn slot_count(&self) -> usize {
+        self.queues.len() + self.legacy.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.queues.is_empty() && self.legacy.is_empty()
+    }
+
+    /// Drop expired queue slots and VRM2 letters. `true` if anything was removed.
+    /// An empty queue stays until `expiry` so a later store still has a write token.
+    pub(crate) fn purge_expired(&mut self, now: u64) -> bool {
         let mut changed = false;
-        map.retain(|_, slot| {
+        self.queues.retain(|_, slot| {
+            if now >= slot.expiry {
+                changed = true;
+                return false;
+            }
+            let before = slot.letters.len();
+            slot.letters
+                .retain(|letter| now.saturating_sub(letter.stored_at) < QUEUE_TTL_SECS);
+            changed |= slot.letters.len() != before;
+            true
+        });
+        self.legacy.retain(|_, slot| {
             let before = slot.len();
-            slot.retain(|s| now.saturating_sub(s.stored_at) < TTL_SECS);
+            slot.retain(|s| now.saturating_sub(s.stored_at) < LEGACY_TTL_SECS);
             changed |= slot.len() != before;
             !slot.is_empty()
         });
+        let challenge_ids: Vec<[u8; 32]> = self.challenges.keys().copied().collect();
+        let stale: Vec<[u8; 32]> = challenge_ids
+            .into_iter()
+            .filter(|id| {
+                self.queues
+                    .get(&queue_slot(self.seal_key.as_ref(), id))
+                    .map(|slot| now >= slot.expiry)
+                    .unwrap_or(true)
+            })
+            .collect();
+        for id in stale {
+            self.challenges.remove(&id);
+        }
         changed
     }
 
-    pub(crate) fn merge(
-        map: &mut MailboxMap,
-        recipient: &str,
-        uploader: &str,
-        envelopes: Vec<OfflineEnvelope>,
-        seal_key: Option<&[u8; 32]>,
+    pub(crate) fn create(
+        &mut self,
+        queue_id: [u8; 32],
+        owner_pk: Vec<u8>,
+        write_token: [u8; 32],
+        expiry: u64,
+        sig: &[u8],
         now: u64,
-    ) -> MergeResult {
-        let mut res = MergeResult::default();
-        let id = slot_id(seal_key, recipient);
-        if !map.contains_key(&id) && map.len() >= MAX_MAILBOXES {
-            res.rejected = envelopes.len();
-            return res;
+    ) -> bool {
+        if owner_pk.len() > MAX_OWNER_PK
+            || sig.len() > MAX_SIG
+            || expiry > now.saturating_add(QUEUE_TTL_SECS)
+            || !verify_create(&owner_pk, &queue_id, &write_token, expiry, sig, now)
+        {
+            return false;
         }
-        let uploader_id = slot_id(seal_key, &format!("uploader|{uploader}"));
-        let slot = map.entry(id).or_default();
-        slot.retain(|s| now.saturating_sub(s.stored_at) < TTL_SECS);
-        let (mut up_count, mut up_bytes) = slot
-            .iter()
-            .filter(|s| s.uploader == uploader_id)
-            .fold((0usize, 0usize), |(c, b), s| (c + 1, b + envelope_len(&s.env)));
-        for env in envelopes {
-            if slot.iter().any(|s| s.env.message_id == env.message_id) {
-                res.duplicate += 1;
-                continue;
-            }
-            let n = envelope_len(&env);
-            if up_count >= MAX_PER_UPLOADER || up_bytes + n > MAX_BYTES_PER_UPLOADER {
-                res.rejected += 1;
-                continue;
-            }
-            up_count += 1;
-            up_bytes += n;
-            slot.push(StoredEnvelope {
-                env,
-                stored_at: now,
-                uploader: uploader_id.clone(),
-            });
-            res.stored += 1;
+        let id = self.slot_of(&queue_id);
+        if !self.queues.contains_key(&id) && self.queues.len() >= MAX_QUEUES {
+            return false;
         }
-        evict_over_cap(slot);
-        if slot.is_empty() {
-            let id = slot_id(seal_key, recipient);
-            map.remove(&id);
-        }
-        res
+        let letters = self
+            .queues
+            .get(&id)
+            .map(|slot| slot.letters.clone())
+            .unwrap_or_default();
+        self.challenges.remove(&queue_id);
+        self.queues.insert(
+            id,
+            QueueSlot {
+                owner_pk,
+                write_token,
+                expiry,
+                letters,
+            },
+        );
+        true
     }
 
-    /// Take a response-sized batch; leave the rest for the next Query.
-    /// Must delete on deliver: `copy_batch` + client re-query was a tight
-    /// loop that saturated yamux and blocked Hop reservations.
-    pub(crate) fn take_batch(
-        map: &mut MailboxMap,
-        recipient: &str,
-        max_plain_bytes: usize,
-        seal_key: Option<&[u8; 32]>,
+    /// Write-token is checked here, before the blob is stored.
+    /// The caller does not pass a recipient, and the slot does not record one.
+    pub(crate) fn store(
+        &mut self,
+        queue_id: &[u8; 32],
+        proof: &[u8; 32],
+        blob: Vec<u8>,
         now: u64,
-    ) -> Vec<OfflineEnvelope> {
-        let id = slot_id(seal_key, recipient);
-        let Some(slot) = map.get_mut(&id) else {
+    ) -> StoreResult {
+        if blob.len() != QUEUE_BUCKET as usize {
+            return StoreResult::Rejected;
+        }
+        let id = self.slot_of(queue_id);
+        let Some(slot) = self.queues.get(&id) else {
+            return StoreResult::Rejected;
+        };
+        if now >= slot.expiry {
+            self.queues.remove(&id);
+            return StoreResult::Rejected;
+        }
+        let expected = write_proof(&slot.write_token, queue_id, &blob);
+        if proof != &expected {
+            return StoreResult::Rejected;
+        }
+        let slot = self.queues.get_mut(&id).expect("slot present");
+        slot.letters
+            .retain(|letter| now.saturating_sub(letter.stored_at) < QUEUE_TTL_SECS);
+        if slot.letters.iter().any(|letter| letter.blob == blob) {
+            return StoreResult::Duplicate { bucket: QUEUE_BUCKET };
+        }
+        let n = blob.len();
+        let len = slot.letters.len();
+        let bytes: usize = slot.letters.iter().map(|letter| letter.blob.len()).sum();
+        if len >= MAX_PER_QUEUE || bytes + n > MAX_BYTES_PER_QUEUE {
+            if len == 0 {
+                return StoreResult::Rejected;
+            }
+            let drop_n = slot.letters[0].blob.len();
+            if len - 1 >= MAX_PER_QUEUE || bytes - drop_n + n > MAX_BYTES_PER_QUEUE {
+                return StoreResult::Rejected;
+            }
+            slot.letters.remove(0);
+        }
+        slot.letters.push(LetterDisk {
+            blob,
+            stored_at: now,
+        });
+        StoreResult::Stored { bucket: QUEUE_BUCKET }
+    }
+
+    pub(crate) fn issue_challenge(
+        &mut self,
+        queue_id: &[u8; 32],
+        now: u64,
+    ) -> Option<([u8; 32], u64)> {
+        let id = self.slot_of(queue_id);
+        let slot = self.queues.get(&id)?;
+        if now >= slot.expiry {
+            return None;
+        }
+        let book = self.challenges.entry(*queue_id).or_default();
+        if book.len() >= MAX_CHALLENGES {
+            book.clear();
+        }
+        let mut nonce = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut nonce);
+        book.insert(nonce, now);
+        Some((nonce, now))
+    }
+
+    /// Drops a challenge this node issued. The owner signature is checked by the caller.
+    pub(crate) fn take_challenge(
+        &mut self,
+        queue_id: &[u8; 32],
+        nonce: &[u8; 32],
+        now: u64,
+    ) -> bool {
+        let Some(book) = self.challenges.get_mut(queue_id) else {
+            return false;
+        };
+        let Some(issued) = book.remove(nonce) else {
+            return false;
+        };
+        if book.is_empty() {
+            self.challenges.remove(queue_id);
+        }
+        issued.abs_diff(now) <= CHALLENGE_TTL_SECS
+    }
+
+    pub(crate) fn owner_pk(&self, queue_id: &[u8; 32], now: u64) -> Option<&[u8]> {
+        let slot = self.queues.get(&self.slot_of(queue_id))?;
+        if now >= slot.expiry {
+            return None;
+        }
+        Some(slot.owner_pk.as_slice())
+    }
+
+    /// Pop a batch by queue id. Caller has already checked the owner signature.
+    pub(crate) fn take_batch(
+        &mut self,
+        queue_id: &[u8; 32],
+        max_plain_bytes: usize,
+        now: u64,
+    ) -> Vec<Vec<u8>> {
+        let id = self.slot_of(queue_id);
+        let Some(slot) = self.queues.get_mut(&id) else {
             return Vec::new();
         };
-        slot.retain(|s| now.saturating_sub(s.stored_at) < TTL_SECS);
+        if now >= slot.expiry {
+            self.queues.remove(&id);
+            return Vec::new();
+        }
+        slot.letters
+            .retain(|letter| now.saturating_sub(letter.stored_at) < QUEUE_TTL_SECS);
+        let mut out = Vec::new();
+        let mut used = 0usize;
+        while let Some(letter) = slot.letters.first() {
+            let n = letter.blob.len();
+            if !out.is_empty() && used.saturating_add(n) > max_plain_bytes {
+                break;
+            }
+            out.push(slot.letters.remove(0).blob);
+            used = used.saturating_add(n);
+            if used >= max_plain_bytes {
+                break;
+            }
+        }
+        out
+    }
+
+    /// VRM2 slot for `recipient`, only when that string is the TCP peer.
+    /// Does not create a slot and does not accept new letters.
+    pub(crate) fn take_legacy(
+        &mut self,
+        recipient: &str,
+        max_plain_bytes: usize,
+        now: u64,
+    ) -> Vec<OfflineEnvelope> {
+        let id = self.legacy_slot(recipient);
+        let Some(slot) = self.legacy.get_mut(&id) else {
+            return Vec::new();
+        };
+        slot.retain(|s| now.saturating_sub(s.stored_at) < LEGACY_TTL_SECS);
         let mut out = Vec::new();
         let mut used = 0usize;
         while let Some(s) = slot.first() {
@@ -242,80 +468,73 @@ impl RelayMailbox {
             }
         }
         if slot.is_empty() {
-            map.remove(&id);
+            self.legacy.remove(&id);
         }
         out
     }
-}
 
-/// `OfflineMailboxStore` rate per uploader: fixed one-minute window.
-/// A 3 MB voice message is ~128 single-envelope requests.
-const STORE_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
-const STORE_MAX_REQUESTS: u32 = 600;
-const STORE_MAX_ENVELOPES: usize = 600;
-const STORE_MAX_BYTES: usize = 48 * 1024 * 1024;
-
-#[derive(Default)]
-pub(crate) struct StoreRateLimit {
-    by_peer: HashMap<libp2p::PeerId, (std::time::Instant, u32, usize, usize)>,
-}
-
-impl StoreRateLimit {
-    pub(crate) fn allow(&mut self, peer: libp2p::PeerId, envelopes: usize, bytes: usize) -> bool {
-        let now = std::time::Instant::now();
-        let e = self.by_peer.entry(peer).or_insert((now, 0, 0, 0));
-        if now.duration_since(e.0) >= STORE_WINDOW {
-            *e = (now, 0, 0, 0);
+    /// Put a query batch back when the onion reply could not be sent.
+    pub(crate) fn restore_queue(&mut self, queue_id: &[u8; 32], blobs: Vec<Vec<u8>>, now: u64) {
+        if blobs.is_empty() {
+            return;
         }
-        if e.1 >= STORE_MAX_REQUESTS
-            || e.2 + envelopes > STORE_MAX_ENVELOPES
-            || e.3 + bytes > STORE_MAX_BYTES
-        {
-            return false;
+        let id = self.slot_of(queue_id);
+        let Some(slot) = self.queues.get_mut(&id) else {
+            return;
+        };
+        for blob in blobs.into_iter().rev() {
+            slot.letters.insert(
+                0,
+                LetterDisk {
+                    blob,
+                    stored_at: now,
+                },
+            );
         }
-        e.1 += 1;
-        e.2 += envelopes;
-        e.3 += bytes;
-        true
     }
 
-    pub(crate) fn forget_idle(&mut self) {
-        let now = std::time::Instant::now();
-        self.by_peer
-            .retain(|_, e| now.duration_since(e.0) < STORE_WINDOW);
-    }
-}
-
-/// Over the per-recipient cap: evict the oldest envelope of the heaviest uploader.
-fn evict_over_cap(slot: &mut Vec<StoredEnvelope>) {
-    let mut total: usize = slot.iter().map(|s| envelope_len(&s.env)).sum();
-    while !slot.is_empty() && (slot.len() > MAX_PER_RECIPIENT || total > MAX_BYTES_PER_RECIPIENT) {
-        let mut bytes_by: HashMap<&str, usize> = HashMap::new();
-        for s in slot.iter() {
-            *bytes_by.entry(s.uploader.as_str()).or_default() += envelope_len(&s.env);
+    pub(crate) fn restore_legacy(&mut self, recipient: &str, envs: Vec<OfflineEnvelope>, now: u64) {
+        if envs.is_empty() {
+            return;
         }
-        let heaviest = bytes_by
-            .into_iter()
-            .max_by_key(|(_, b)| *b)
-            .map(|(u, _)| u.to_string())
-            .unwrap_or_default();
-        let idx = slot
-            .iter()
-            .position(|s| s.uploader == heaviest)
-            .unwrap_or(0);
-        total -= envelope_len(&slot.remove(idx).env);
+        let id = self.legacy_slot(recipient);
+        let slot = self.legacy.entry(id).or_default();
+        for env in envs.into_iter().rev() {
+            slot.insert(
+                0,
+                StoredEnvelope {
+                    env,
+                    stored_at: now,
+                    uploader: String::new(),
+                },
+            );
+        }
+    }
+
+    fn slot_of(&self, queue_id: &[u8; 32]) -> String {
+        queue_slot(self.seal_key.as_ref(), queue_id)
+    }
+
+    fn legacy_slot(&self, recipient: &str) -> String {
+        match self.seal_key.as_ref() {
+            Some(key) => crate::seal::mailbox_slot(key, recipient),
+            None => recipient.to_string(),
+        }
     }
 }
 
-fn slot_id(seal_key: Option<&[u8; 32]>, recipient: &str) -> String {
+fn queue_slot(seal_key: Option<&[u8; 32]>, queue_id: &[u8; 32]) -> String {
+    let hex = void_onion::hex32(queue_id);
     match seal_key {
-        Some(key) => crate::seal::mailbox_slot(key, recipient),
-        None => recipient.to_string(),
+        Some(key) => crate::seal::mailbox_slot(key, &hex),
+        None => hex,
     }
 }
 
-/// Old mailbox files keyed by PeerId — hash them so a decrypted dump
-/// does not list who uses the network.
+fn envelope_len(env: &OfflineEnvelope) -> usize {
+    env.ct.len() + 96
+}
+
 fn remap_slots(
     map: HashMap<String, Vec<OfflineEnvelope>>,
     key: &[u8; 32],
@@ -335,115 +554,165 @@ fn remap_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libp2p::identity::Keypair;
 
-    fn env(id: &str, ct_len: usize) -> OfflineEnvelope {
+    fn owner_queue(now: u64) -> (Keypair, [u8; 32], [u8; 32], u64, Vec<u8>) {
+        let kp = Keypair::generate_ed25519();
+        let queue_id = [7u8; 32];
+        let write_token = [9u8; 32];
+        let expiry = now + QUEUE_TTL_SECS;
+        let sig = kp
+            .sign(&queue_mail::create_message(&queue_id, &write_token, expiry))
+            .unwrap();
+        (kp, queue_id, write_token, expiry, sig)
+    }
+
+    fn blob(byte: u8) -> Vec<u8> {
+        vec![byte; QUEUE_BUCKET as usize]
+    }
+
+    fn env(id: &str) -> OfflineEnvelope {
         OfflineEnvelope {
             v: 3,
             sender: String::new(),
             sender_pk: [0u8; 32],
             message_id: id.into(),
             kind: String::new(),
-            eph: [0u8; 32],
-            nonce: [0u8; 12],
-            ct: vec![0u8; ct_len],
+            eph: [1u8; 32],
+            nonce: [2u8; 12],
+            ct: vec![3u8; 8],
+            local_kind: String::new(),
         }
     }
 
     #[test]
-    fn take_batch_does_not_wipe_whole_mailbox() {
-        let mut map = HashMap::new();
-        let recip = "peer";
-        let big = (0..20)
-            .map(|i| env(&format!("c{i}"), 40_000))
-            .collect::<Vec<_>>();
-        assert!(RelayMailbox::merge(&mut map, recip, "alice", big, None, 100).changed());
-        let first = RelayMailbox::take_batch(&mut map, recip, 100_000, None, 100);
-        assert!(!first.is_empty());
-        assert!(map.get(recip).map(|s| !s.is_empty()).unwrap_or(false));
-        let second = RelayMailbox::take_batch(&mut map, recip, 100_000, None, 100);
-        assert!(!second.is_empty());
-        assert_ne!(first[0].message_id, second[0].message_id);
+    fn store_needs_write_token_and_records_no_recipient() {
+        let now = 1_700_000_000u64;
+        let (kp, queue_id, token, expiry, sig) = owner_queue(now);
+        let mut mail = RelayMailbox::empty(None);
+        assert!(mail.create(
+            queue_id,
+            kp.public().encode_protobuf(),
+            token,
+            expiry,
+            &sig,
+            now,
+        ));
+        assert_eq!(
+            mail.store(&queue_id, &[0u8; 32], blob(1), now),
+            StoreResult::Rejected
+        );
+        let proof = write_proof(&token, &queue_id, &blob(1));
+        assert_eq!(
+            mail.store(&queue_id, &proof, blob(1), now),
+            StoreResult::Stored { bucket: QUEUE_BUCKET }
+        );
+        let disk = QueueDisk {
+            owner_pk: kp.public().encode_protobuf(),
+            write_token: token,
+            expiry,
+            letters: vec![LetterDisk {
+                blob: blob(1),
+                stored_at: now,
+            }],
+        };
+        let json = serde_json::to_string(&disk).unwrap();
+        assert!(!json.contains("recipient"));
+        assert!(!json.contains("uploader"));
+        assert!(!json.contains("12D3Koo"));
     }
 
     #[test]
-    fn envelopes_expire_after_ttl() {
-        let mut map = HashMap::new();
-        RelayMailbox::merge(&mut map, "bob", "alice", vec![env("m1", 10)], None, 1_000);
-        assert!(!RelayMailbox::purge_expired(&mut map, 1_000 + TTL_SECS - 1));
-        assert!(RelayMailbox::purge_expired(&mut map, 1_000 + TTL_SECS));
-        assert!(map.is_empty());
-        RelayMailbox::merge(&mut map, "bob", "alice", vec![env("m2", 10)], None, 1_000);
-        assert!(RelayMailbox::take_batch(&mut map, "bob", 1 << 20, None, 1_000 + TTL_SECS).is_empty());
+    fn slot_is_hash_of_queue_id_not_peer() {
+        let key = [4u8; 32];
+        let queue_id = [8u8; 32];
+        let slot = queue_slot(Some(&key), &queue_id);
+        let peer = crate::seal::mailbox_slot(&key, "12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG");
+        assert_eq!(slot, crate::seal::mailbox_slot(&key, &void_onion::hex32(&queue_id)));
+        assert_ne!(slot, peer);
     }
 
     #[test]
-    fn uploader_quota_rejects_excess() {
-        let mut map = HashMap::new();
-        let flood = (0..MAX_PER_UPLOADER + 10)
-            .map(|i| env(&format!("f{i}"), 10))
-            .collect::<Vec<_>>();
-        let r = RelayMailbox::merge(&mut map, "bob", "mallory", flood, None, 1);
-        assert_eq!(r.stored, MAX_PER_UPLOADER);
-        assert_eq!(r.rejected, 10);
-        let ok = RelayMailbox::merge(&mut map, "bob", "alice", vec![env("real", 10)], None, 1);
-        assert_eq!(ok.stored, 1);
+    fn take_batch_does_not_check_a_signature() {
+        let now = 1_700_000_000u64;
+        let (kp, queue_id, token, expiry, sig) = owner_queue(now);
+        let mut mail = RelayMailbox::empty(None);
+        assert!(mail.create(
+            queue_id,
+            kp.public().encode_protobuf(),
+            token,
+            expiry,
+            &sig,
+            now,
+        ));
+        let body = blob(2);
+        let proof = write_proof(&token, &queue_id, &body);
+        assert!(matches!(
+            mail.store(&queue_id, &proof, body.clone(), now),
+            StoreResult::Stored { .. }
+        ));
+        let got = mail.take_batch(&queue_id, DELIVER_BATCH_PLAIN_BYTES, now);
+        assert_eq!(got, vec![body]);
+        assert!(mail.take_batch(&queue_id, DELIVER_BATCH_PLAIN_BYTES, now).is_empty());
     }
 
     #[test]
-    fn store_rate_limit_per_peer() {
-        let mut rl = StoreRateLimit::default();
-        let (a, b) = (libp2p::PeerId::random(), libp2p::PeerId::random());
-        for _ in 0..STORE_MAX_REQUESTS {
-            assert!(rl.allow(a, 1, 10));
-        }
-        assert!(!rl.allow(a, 1, 10));
-        assert!(rl.allow(b, 1, 10));
-        assert!(!rl.allow(b, 1, STORE_MAX_BYTES));
+    fn vrm2_peer_slot_drains_and_accepts_nothing_new() {
+        let now = 1_000u64;
+        let recip = "12D3KooWpeer";
+        let mut by_recipient = HashMap::new();
+        by_recipient.insert(
+            recip.to_string(),
+            vec![StoredEnvelope {
+                env: env("old"),
+                stored_at: now,
+                uploader: "hashed-uploader".into(),
+            }],
+        );
+        let mut bytes = FORMAT_V2.to_vec();
+        bytes.extend(bincode::serialize(&RelayDataV2 { by_recipient }).unwrap());
+        let mut mail = RelayMailbox::empty(None);
+        mail.ingest(&bytes, now);
+        assert_eq!(mail.take_legacy(recip, 1 << 20, now).len(), 1);
+        assert!(mail.take_legacy(recip, 1 << 20, now).is_empty());
+        assert!(mail.legacy.is_empty());
+        assert_eq!(
+            mail.store(&[1u8; 32], &[2u8; 32], blob(3), now),
+            StoreResult::Rejected
+        );
     }
 
     #[test]
-    fn duplicate_is_not_rejected() {
-        let mut map = HashMap::new();
-        RelayMailbox::merge(&mut map, "bob", "alice", vec![env("m1", 10)], None, 1);
-        let r = RelayMailbox::merge(&mut map, "bob", "alice", vec![env("m1", 10)], None, 1);
-        assert_eq!(r, MergeResult { stored: 0, duplicate: 1, rejected: 0 });
-    }
+    fn legacy_expires_at_seven_days_queue_at_its_expiry() {
+        let now = 1_000u64;
+        let mut mail = RelayMailbox::empty(None);
+        mail.legacy.insert(
+            "bob".into(),
+            vec![StoredEnvelope {
+                env: env("m"),
+                stored_at: now,
+                uploader: String::new(),
+            }],
+        );
+        assert!(!mail.purge_expired(now + LEGACY_TTL_SECS - 1));
+        assert!(mail.purge_expired(now + LEGACY_TTL_SECS));
+        assert!(mail.legacy.is_empty());
 
-    #[test]
-    fn mailbox_ceiling_rejects_a_new_slot() {
-        let mut map = HashMap::new();
-        for i in 0..4096 {
-            let r = RelayMailbox::merge(
-                &mut map,
-                &format!("r{i}"),
-                "alice",
-                vec![env(&format!("m{i}"), 8)],
-                None,
-                1,
-            );
-            assert_eq!(r.stored, 1);
-        }
-        let extra = RelayMailbox::merge(&mut map, "overflow", "alice", vec![env("x", 8)], None, 1);
-        assert_eq!(extra.rejected, 1);
-        assert_eq!(extra.stored, 0);
-        assert_eq!(map.len(), 4096);
-        let again = RelayMailbox::merge(&mut map, "r0", "alice", vec![env("more", 8)], None, 1);
-        assert_eq!(again.stored, 1);
-    }
-
-    fn flood_from_many_ids_evicts_flooders_not_real_mail() {
-        let mut map = HashMap::new();
-        RelayMailbox::merge(&mut map, "bob", "alice", vec![env("real", 1_000)], None, 1);
-        for s in 0..8 {
-            let flood = (0..MAX_PER_UPLOADER)
-                .map(|i| env(&format!("s{s}-{i}"), 30_000))
-                .collect::<Vec<_>>();
-            RelayMailbox::merge(&mut map, "bob", &format!("sybil{s}"), flood, None, 1);
-        }
-        let slot = map.get("bob").unwrap();
-        assert!(slot.iter().any(|s| s.env.message_id == "real"));
-        assert!(slot.len() <= MAX_PER_RECIPIENT);
-        let total: usize = slot.iter().map(|s| envelope_len(&s.env)).sum();
-        assert!(total <= MAX_BYTES_PER_RECIPIENT);
+        let (kp, queue_id, token, expiry, sig) = owner_queue(now);
+        assert!(mail.create(
+            queue_id,
+            kp.public().encode_protobuf(),
+            token,
+            expiry,
+            &sig,
+            now,
+        ));
+        let proof = write_proof(&token, &queue_id, &blob(4));
+        assert!(matches!(
+            mail.store(&queue_id, &proof, blob(4), now),
+            StoreResult::Stored { .. }
+        ));
+        assert!(mail.take_batch(&queue_id, 1 << 20, expiry).is_empty());
+        assert!(!mail.queues.contains_key(&queue_slot(None, &queue_id)));
     }
 }

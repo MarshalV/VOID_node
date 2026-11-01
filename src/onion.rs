@@ -7,7 +7,6 @@ use chacha20poly1305::{
 };
 use hkdf::Hkdf;
 use libp2p::{identity::Keypair, PeerId};
-use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::collections::{HashMap, VecDeque};
@@ -345,10 +344,6 @@ impl OnionMaterial {
     }
 }
 
-pub fn public_bytes(sk: &StaticSecret) -> [u8; 32] {
-    PublicKey::from(sk).to_bytes()
-}
-
 pub fn open(
     hop_sk: &StaticSecret,
     eph: &[u8; 32],
@@ -414,186 +409,34 @@ impl EphReplay {
     }
 }
 
-pub const V2_BUCKETS: [usize; 3] = [2 * 1024, 16 * 1024, 64 * 1024];
-const V2_SLOTS: usize = 3;
-const V2_SLOT_PLAIN: usize = 64;
-const V2_SLOT_CT: usize = V2_SLOT_PLAIN + 16;
-const V2_SLOT_LEN: usize = 32 + 12 + V2_SLOT_CT;
-const V2_HEADER_LEN: usize = V2_SLOT_LEN * V2_SLOTS;
-const V2_SALT: &[u8] = b"VOID_ONION_SALT_v2";
-const V2_INFO: &[u8] = b"VOID_ONION_v2";
-
 pub enum V2Peel {
     Forward { next: PeerId, cell: Vec<u8> },
     Deliver { next: PeerId, body: Vec<u8> },
 }
 
-fn v2_okm(shared: &[u8; 32], eph: &[u8; 32], hop_pk: &[u8; 32], which: &[u8]) -> Result<[u8; 32]> {
-    if shared.iter().all(|&b| b == 0) {
-        return Err(anyhow!("onion low-order point"));
-    }
-    let mut info = Vec::with_capacity(V2_INFO.len() + 64 + which.len());
-    info.extend_from_slice(V2_INFO);
-    info.extend_from_slice(eph);
-    info.extend_from_slice(hop_pk);
-    info.extend_from_slice(which);
-    let hk = Hkdf::<Sha256>::new(Some(V2_SALT), shared);
-    let mut okm = [0u8; 32];
-    hk.expand(&info, &mut okm)
-        .map_err(|_| anyhow!("onion v2 hkdf"))?;
-    Ok(okm)
+fn peer_from_onion(id: void_onion::PeerId) -> Result<PeerId> {
+    PeerId::from_bytes(&id.to_bytes()).map_err(|_| anyhow!("onion v2 next"))
 }
 
-fn xor_stream(key: &[u8; 32], body: &mut [u8]) {
-    let mut counter = 0u32;
-    let mut off = 0;
-    while off < body.len() {
-        let hk = Hkdf::<Sha256>::new(Some(key), &counter.to_le_bytes());
-        let mut block = [0u8; 32];
-        if hk.expand(b"VOID_ONION_v2_STREAM", &mut block).is_err() {
-            return;
-        }
-        let n = (body.len() - off).min(32);
-        for i in 0..n {
-            body[off + i] ^= block[i];
-        }
-        off += n;
-        counter = counter.wrapping_add(1);
+fn map_peel(peeled: void_onion::V2Peel) -> Result<V2Peel> {
+    match peeled {
+        void_onion::V2Peel::Forward { next, cell } => Ok(V2Peel::Forward {
+            next: peer_from_onion(next)?,
+            cell,
+        }),
+        void_onion::V2Peel::Deliver { next, body } => Ok(V2Peel::Deliver {
+            next: peer_from_onion(next)?,
+            body,
+        }),
     }
 }
 
-#[cfg(test)]
-fn write_peer(plain: &mut [u8], peer: PeerId) -> bool {
-    let raw = peer.to_bytes();
-    if raw.len() > 48 || plain.len() < 3 + raw.len() {
-        return false;
-    }
-    plain[2] = raw.len() as u8;
-    plain[3..3 + raw.len()].copy_from_slice(&raw);
-    true
-}
-
-fn read_peer(plain: &[u8]) -> Option<PeerId> {
-    let n = *plain.get(2)? as usize;
-    if n == 0 || n > 48 || plain.len() < 3 + n {
-        return None;
-    }
-    PeerId::from_bytes(&plain[3..3 + n]).ok()
-}
-
-#[cfg(test)]
-fn seal_slot(hop_pk: &[u8; 32], next: PeerId, deliver: bool) -> Result<([u8; V2_SLOT_LEN], [u8; 32])> {
-    let hop = PublicKey::from(*hop_pk);
-    let eph_sk = StaticSecret::random_from_rng(rand::rngs::OsRng);
-    let eph = PublicKey::from(&eph_sk).to_bytes();
-    let shared = eph_sk.diffie_hellman(&hop);
-    let hdr_key = v2_okm(shared.as_bytes(), &eph, hop_pk, b"HDR")?;
-    let stream_key = v2_okm(shared.as_bytes(), &eph, hop_pk, b"STREAM")?;
-    let mut plain = [0u8; V2_SLOT_PLAIN];
-    rand::thread_rng().fill_bytes(&mut plain);
-    plain[0] = 2;
-    plain[1] = u8::from(deliver);
-    if !write_peer(&mut plain, next) {
-        return Err(anyhow!("onion v2 peer id"));
-    }
-    let cipher = ChaCha20Poly1305::new_from_slice(&hdr_key).map_err(|e| anyhow!("{e}"))?;
-    let mut nonce = [0u8; 12];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    let ct = cipher
-        .encrypt(Nonce::from_slice(&nonce), plain.as_ref())
-        .map_err(|_| anyhow!("onion v2 slot"))?;
-    if ct.len() != V2_SLOT_CT {
-        return Err(anyhow!("onion v2 slot len"));
-    }
-    let mut slot = [0u8; V2_SLOT_LEN];
-    slot[..32].copy_from_slice(&eph);
-    slot[32..44].copy_from_slice(&nonce);
-    slot[44..].copy_from_slice(&ct);
-    Ok((slot, stream_key))
-}
-
-#[cfg(test)]
-fn bucket_for(body_payload: usize) -> Option<usize> {
-    V2_BUCKETS
-        .into_iter()
-        .find(|b| b.saturating_sub(V2_HEADER_LEN) >= body_payload)
-}
-
-#[cfg(test)]
-pub fn wrap_v2(hops: &[(PeerId, [u8; 32])], dest: PeerId, body: &[u8]) -> Result<Vec<u8>> {
-    if hops.is_empty() || hops.len() > V2_SLOTS {
-        return Err(anyhow!("onion v2 hops"));
-    }
-    let need = body
-        .len()
-        .checked_add(4)
-        .ok_or_else(|| anyhow!("onion v2 too large"))?;
-    let bucket = bucket_for(need).ok_or_else(|| anyhow!("onion v2 too large"))?;
-    let body_len = bucket - V2_HEADER_LEN;
-    let mut plain_body = vec![0u8; body_len];
-    rand::thread_rng().fill_bytes(&mut plain_body);
-    plain_body[..4].copy_from_slice(&(body.len() as u32).to_le_bytes());
-    plain_body[4..4 + body.len()].copy_from_slice(body);
-    let mut slots = vec![[0u8; V2_SLOT_LEN]; V2_SLOTS];
-    for i in (0..hops.len()).rev() {
-        let deliver = i + 1 == hops.len();
-        let next = if deliver { dest } else { hops[i + 1].0 };
-        let (slot, stream) = seal_slot(&hops[i].1, next, deliver)?;
-        xor_stream(&stream, &mut plain_body);
-        slots[i] = slot;
-    }
-    for slot in slots.iter_mut().skip(hops.len()) {
-        rand::thread_rng().fill_bytes(slot);
-    }
-    let mut cell = Vec::with_capacity(bucket);
-    for slot in &slots {
-        cell.extend_from_slice(slot);
-    }
-    cell.extend_from_slice(&plain_body);
-    Ok(cell)
-}
-
-pub fn peel_v2(sk: &StaticSecret, cell: &[u8]) -> Result<V2Peel> {
-    if !V2_BUCKETS.contains(&cell.len()) || cell.len() < V2_HEADER_LEN {
-        return Err(anyhow!("onion v2 size"));
-    }
-    let hop_pk = PublicKey::from(sk).to_bytes();
-    let eph: [u8; 32] = cell[..32].try_into().unwrap();
-    let nonce: [u8; 12] = cell[32..44].try_into().unwrap();
-    let ct = &cell[44..V2_SLOT_LEN];
-    let shared = sk.diffie_hellman(&PublicKey::from(eph));
-    let hdr_key = v2_okm(shared.as_bytes(), &eph, &hop_pk, b"HDR")?;
-    let stream_key = v2_okm(shared.as_bytes(), &eph, &hop_pk, b"STREAM")?;
-    let cipher = ChaCha20Poly1305::new_from_slice(&hdr_key).map_err(|e| anyhow!("{e}"))?;
-    let plain = cipher
-        .decrypt(Nonce::from_slice(&nonce), ct)
-        .map_err(|_| anyhow!("onion v2 open"))?;
-    if plain.len() != V2_SLOT_PLAIN || plain[0] != 2 {
-        return Err(anyhow!("onion v2 header"));
-    }
-    let next = read_peer(&plain).ok_or_else(|| anyhow!("onion v2 next"))?;
-    let mut body = cell[V2_HEADER_LEN..].to_vec();
-    xor_stream(&stream_key, &mut body);
-    if plain[1] == 1 {
-        return Ok(V2Peel::Deliver { next, body });
-    }
-    let mut forwarded = Vec::with_capacity(cell.len());
-    forwarded.extend_from_slice(&cell[V2_SLOT_LEN..V2_HEADER_LEN]);
-    let mut pad = vec![0u8; V2_SLOT_LEN];
-    rand::thread_rng().fill_bytes(&mut pad);
-    forwarded.extend_from_slice(&pad);
-    forwarded.extend_from_slice(&body);
-    Ok(V2Peel::Forward {
-        next,
-        cell: forwarded,
-    })
-}
 
 pub fn peel_material(mat: &OnionMaterial, cell: &[u8]) -> Result<V2Peel> {
-    match peel_v2(&mat.current, cell) {
-        Ok(p) => Ok(p),
+    match void_onion::peel_v2(&mat.current, cell) {
+        Ok(p) => map_peel(p),
         Err(e) => match &mat.prev {
-            Some(prev) => peel_v2(prev, cell).or(Err(e)),
+            Some(prev) => void_onion::peel_v2(prev, cell).or(Err(e)).and_then(map_peel),
             None => Err(e),
         },
     }
@@ -719,21 +562,22 @@ mod tests {
     }
 
     #[test]
-    fn v2_peel_roundtrip_same_length() {
+    fn v2_peel_uses_crate() {
         let keys: Vec<StaticSecret> = (0..3)
             .map(|_| StaticSecret::random_from_rng(rand::rngs::OsRng))
             .collect();
-        let hops: Vec<(PeerId, [u8; 32])> = keys
+        let hops: Vec<(void_onion::PeerId, [u8; 32])> = keys
             .iter()
-            .map(|sk| (PeerId::random(), PublicKey::from(sk).to_bytes()))
+            .map(|sk| (void_onion::PeerId::random(), PublicKey::from(sk).to_bytes()))
             .collect();
-        let dest = PeerId::random();
+        let dest = void_onion::PeerId::random();
         let payload = b"opaque-deliver";
-        let cell = wrap_v2(&hops, dest, payload).unwrap();
+        let cell = void_onion::wrap_v2(&hops, dest, payload).unwrap();
         let len = cell.len();
         let mut cur = cell;
         for sk in keys.iter().take(2) {
-            match peel_v2(sk, &cur).unwrap() {
+            let mat = hop_mat(sk);
+            match peel_material(&mat, &cur).unwrap() {
                 V2Peel::Forward { cell, .. } => {
                     assert_eq!(cell.len(), len);
                     cur = cell;
@@ -741,13 +585,25 @@ mod tests {
                 V2Peel::Deliver { .. } => panic!("early deliver"),
             }
         }
-        match peel_v2(&keys[2], &cur).unwrap() {
+        match peel_material(&hop_mat(&keys[2]), &cur).unwrap() {
             V2Peel::Deliver { next, body } => {
-                assert_eq!(next, dest);
+                let want = PeerId::from_bytes(&dest.to_bytes()).unwrap();
+                assert_eq!(next, want);
                 let n = u32::from_le_bytes(body[..4].try_into().unwrap()) as usize;
                 assert_eq!(&body[4..4 + n], payload);
             }
             V2Peel::Forward { .. } => panic!("expected deliver"),
+        }
+    }
+
+    fn hop_mat(sk: &StaticSecret) -> OnionMaterial {
+        OnionMaterial {
+            current: StaticSecret::from(sk.to_bytes()),
+            prev: None,
+            epoch: 1,
+            not_after: u64::MAX,
+            prev_not_after: 0,
+            operator: String::new(),
         }
     }
 }

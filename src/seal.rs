@@ -79,11 +79,12 @@ pub fn restrict_file_mode(path: &std::path::Path) {
     let _ = path;
 }
 
-pub fn mailbox_slot(key: &[u8; 32], recipient: &str) -> String {
+/// Slot name. `label` is the queue id in hex, or a legacy PeerId still draining from VRM2.
+pub fn mailbox_slot(key: &[u8; 32], label: &str) -> String {
     use sha2::Digest;
     let mut h = Sha256::new();
     h.update(key);
     h.update(b"|mbox|");
-    h.update(recipient.as_bytes());
+    h.update(label.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }

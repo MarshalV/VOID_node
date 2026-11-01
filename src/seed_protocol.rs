@@ -13,8 +13,10 @@
 //   * AEAD: ChaCha20-Poly1305 (RFC 8439)
 //   * KDF: HKDF-SHA-512
 //   * Mutual authentication: each side signs
-//     "VOID-SEED/v1|<dir>|e_c||e_s||own PeerId||timestamp" (client also
-//     appends the server PeerId). timestamp is the same field as in AuthPayload.
+//     "/void-seed/v1|<dir>|e_c|e_s|own PeerId|timestamp" and the client
+//     also appends the server PeerId. msg4 adds a server confirmation
+//     "/void-seed/v1|both|e_c|e_s|server PeerId|client PeerId|timestamp".
+//     timestamp is the same field as in AuthPayload.
 //   * protocol_version == "/void/v1" inside AEAD is a version marker, not
 //     access control: any running VOID node binary can produce it.
 //
@@ -85,6 +87,14 @@ pub enum SeedRequest {
 pub enum SeedResponse {
     Peers { peers: Vec<SeedEntry> },
     Error { message: String },
+}
+
+/// msg4. Сервер подписывает оба PeerId и время. Клиент не принимает список без подписи.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SeedDelivery {
+    pub confirm_ts: u64,
+    pub confirm_sig: Vec<u8>,
+    pub response: SeedResponse,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -217,6 +227,57 @@ fn build_auth(
     })
 }
 
+fn both_context(e_c: &[u8; 32], e_s: &[u8; 32], server_peer: &[u8], client_peer: &[u8], timestamp: u64) -> Vec<u8> {
+    let mut v = Vec::with_capacity(PROTOCOL_VERSION.len() + 6 + 64 + server_peer.len() + client_peer.len() + 8);
+    v.extend_from_slice(PROTOCOL_VERSION.as_bytes());
+    v.extend_from_slice(b"|both|");
+    v.extend_from_slice(e_c);
+    v.extend_from_slice(e_s);
+    v.extend_from_slice(server_peer);
+    v.extend_from_slice(client_peer);
+    v.extend_from_slice(&timestamp.to_le_bytes());
+    v
+}
+
+pub fn encode_seed_delivery(
+    kp: &identity::Keypair,
+    e_c: &[u8; 32],
+    e_s: &[u8; 32],
+    client_peer: &[u8],
+    response: SeedResponse,
+) -> Result<Vec<u8>> {
+    let (_, sk) = ed25519_from_libp2p(kp)?;
+    let server_peer = kp.public().to_peer_id().to_bytes();
+    let confirm_ts = now_secs();
+    let ctx = both_context(e_c, e_s, &server_peer, client_peer, confirm_ts);
+    let confirm_sig = sk.sign(&ctx).to_bytes().to_vec();
+    bincode::serialize(&SeedDelivery {
+        confirm_ts,
+        confirm_sig,
+        response,
+    })
+    .context("encode seed delivery")
+}
+
+pub fn open_seed_delivery(
+    bytes: &[u8],
+    server_ed: &[u8; 32],
+    e_c: &[u8; 32],
+    e_s: &[u8; 32],
+    server_peer: &[u8],
+    client_peer: &[u8],
+) -> Result<SeedResponse> {
+    let delivery: SeedDelivery = bincode::deserialize(bytes).context("msg4 deserialize")?;
+    let vk = VerifyingKey::from_bytes(server_ed).map_err(|_| anyhow!("server ed25519"))?;
+    let sig = Signature::from_slice(&delivery.confirm_sig).map_err(|_| anyhow!("confirm sig"))?;
+    let ctx = both_context(e_c, e_s, server_peer, client_peer, delivery.confirm_ts);
+    vk.verify(&ctx, &sig).map_err(|_| anyhow!("seed confirm"))?;
+    if now_secs().abs_diff(delivery.confirm_ts) > 300 {
+        bail!("seed confirm timestamp");
+    }
+    Ok(delivery.response)
+}
+
 pub fn verify_auth(
     auth: &AuthPayload,
     direction: &str,
@@ -315,6 +376,9 @@ pub struct ServerHandshakeResult {
     #[allow(dead_code)]
     pub peer_auth: AuthPayload,
     pub request: SeedRequest,
+    pub e_c: [u8; 32],
+    pub e_s: [u8; 32],
+    pub client_peer: Vec<u8>,
 }
 
 pub async fn server_handshake<S>(
@@ -373,7 +437,14 @@ where
         send_counter: 0,
     };
 
-    Ok(ServerHandshakeResult { session, peer_auth: cmsg.auth, request: cmsg.request })
+    Ok(ServerHandshakeResult {
+        session,
+        peer_auth: cmsg.auth.clone(),
+        request: cmsg.request,
+        e_c: e_c_pub_bytes,
+        e_s: e_s_pub_bytes,
+        client_peer: cmsg.auth.peer_id_bytes,
+    })
 }
 
 pub struct ClientExchangeResult {
@@ -433,7 +504,15 @@ where
     let m4_pt = cipher2
         .decrypt(&nonce(1), Payload { msg: &m4, aad: PROTOCOL_VERSION.as_bytes() })
         .map_err(|e| anyhow!("decrypt msg4: {e}"))?;
-    let response: SeedResponse = bincode::deserialize(&m4_pt).context("msg4 deserialize")?;
+    let response = open_seed_delivery(
+        &m4_pt,
+        &auth_s.static_ed_pub,
+        &e_c_pub_bytes,
+        &e_s_pub_bytes,
+        &auth_s.peer_id_bytes,
+        &kp.public().to_peer_id().to_bytes(),
+    )
+    .context("seed confirm")?;
 
     Ok(ClientExchangeResult { peer_auth: auth_s, response, peer_id_b58 })
 }

@@ -92,7 +92,14 @@ async fn handle_conn(
         }
     };
 
-    let pt = bincode::serialize(&answer).context("encode response")?;
+    let pt = seed_protocol::encode_seed_delivery(
+        &state.keypair,
+        &hs.e_c,
+        &hs.e_s,
+        &hs.client_peer,
+        answer,
+    )
+    .context("encode response")?;
     let ct = session.encrypt(&pt).context("encrypt response")?;
     write_frame(&mut stream, &ct).await.context("msg4 write")?;
 
