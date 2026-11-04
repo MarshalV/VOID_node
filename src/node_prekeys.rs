@@ -50,7 +50,8 @@ pub(crate) struct PrekeyOfferOut {
     pub(crate) public_key: [u8; 32],
     pub(crate) not_after: u64,
     pub(crate) sig: Vec<u8>,
-    pub(crate) opk: OneTimePrekey,
+    /// `None` — пул пуст, signed-prekey ещё годится. Письмо печатается на него.
+    pub(crate) opk: Option<OneTimePrekey>,
     pub(crate) kem_ek: Vec<u8>,
 }
 
@@ -152,11 +153,36 @@ impl PrekeyDir {
             let _ = self.save();
             return None;
         }
-        let offer = {
-            let rec = self.records.get_mut(peer)?;
-            if rec.opks.is_empty() {
+        let has_opk = self
+            .records
+            .get(peer)
+            .is_some_and(|rec| !rec.opks.is_empty());
+        if !has_opk {
+            let rec = self.records.get(peer)?;
+            let spk = if rec.kem_ek.len() == KEM_EK_LEN {
+                let mut ek = [0u8; KEM_EK_LEN];
+                ek.copy_from_slice(&rec.kem_ek);
+                offline_mail::SignedPrekey {
+                    pk: rec.pk,
+                    not_after: rec.not_after,
+                    kem_ek: ek,
+                }
+            } else {
+                offline_mail::SignedPrekey::x25519(rec.pk, rec.not_after)
+            };
+            if !offline_mail::prekey_is_sealable(spk, now) {
                 return None;
             }
+            return Some(PrekeyOfferOut {
+                public_key: rec.pk,
+                not_after: rec.not_after,
+                sig: rec.sig.clone(),
+                opk: None,
+                kem_ek: rec.kem_ek.clone(),
+            });
+        }
+        let offer = {
+            let rec = self.records.get_mut(peer)?;
             let opk = rec.opks.remove(0);
             rec.spent.push(opk.id);
             if rec.spent.len() > MAX_SPENT {
@@ -167,14 +193,16 @@ impl PrekeyDir {
                 public_key: rec.pk,
                 not_after: rec.not_after,
                 sig: rec.sig.clone(),
-                opk,
+                opk: Some(opk),
                 kem_ek: rec.kem_ek.clone(),
             }
         };
         if self.save().is_err() {
             let rec = self.records.get_mut(peer)?;
             rec.spent.pop();
-            rec.opks.insert(0, offer.opk);
+            if let Some(opk) = offer.opk.clone() {
+                rec.opks.insert(0, opk);
+            }
             return None;
         }
         Some(offer)
@@ -295,13 +323,15 @@ mod tests {
             now,
         ));
         let first = store.take(&peer, now).unwrap();
-        assert_eq!(first.opk.id, [1u8; 16]);
+        assert_eq!(first.opk.unwrap().id, [1u8; 16]);
         assert_eq!(first.kem_ek, kem);
         drop(store);
         let mut again = PrekeyDir::open(&dir.join(FILE_NAME), [9u8; 32]);
         let second = again.take(&peer, now).unwrap();
-        assert_eq!(second.opk.id, [2u8; 16]);
-        assert!(again.take(&peer, now).is_none());
+        assert_eq!(second.opk.unwrap().id, [2u8; 16]);
+        let bare = again.take(&peer, now).unwrap();
+        assert!(bare.opk.is_none());
+        assert_eq!(bare.public_key, published.pk);
         assert!(again.put(
             &peer,
             published.pk,
@@ -311,7 +341,7 @@ mod tests {
             vec![opk(&kp, 1)],
             now,
         ));
-        assert!(again.take(&peer, now).is_none());
+        assert!(again.take(&peer, now).unwrap().opk.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -339,11 +369,12 @@ mod tests {
             now,
         ));
         let first = store.take(&peer, now).unwrap();
-        assert_eq!(first.opk.id, [7u8; 16]);
-        assert!(store.take(&peer, now).is_none());
+        assert_eq!(first.opk.unwrap().id, [7u8; 16]);
+        let second = store.take(&peer, now).unwrap();
+        assert!(second.opk.is_none());
         drop(store);
         let mut again = PrekeyDir::open(&dir.join(FILE_NAME), [9u8; 32]);
-        assert!(again.take(&peer, now).is_none());
+        assert!(again.take(&peer, now).unwrap().opk.is_none());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

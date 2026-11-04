@@ -345,6 +345,15 @@ impl RelayMailbox {
         if slot.letters.iter().any(|letter| letter.blob == blob) {
             return StoreResult::Duplicate { bucket: QUEUE_BUCKET };
         }
+        // Повтор того же письма с новым эфемером — тот же внешний id, не новая запись.
+        if let Some(incoming) = queue_mail::unpad_queue_blob(&blob) {
+            if slot.letters.iter().any(|letter| {
+                queue_mail::unpad_queue_blob(&letter.blob)
+                    .is_some_and(|old| old.message_id == incoming.message_id && !old.message_id.is_empty())
+            }) {
+                return StoreResult::Duplicate { bucket: QUEUE_BUCKET };
+            }
+        }
         let n = blob.len();
         let len = slot.letters.len();
         let bytes: usize = slot.letters.iter().map(|letter| letter.blob.len()).sum();
@@ -776,6 +785,5 @@ mod tests {
         assert!(!mail.queues.contains_key(&queue_slot(None, &queue_id)));
     }
 }
-
 
 

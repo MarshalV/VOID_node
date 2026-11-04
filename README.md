@@ -205,7 +205,7 @@ A client with a live queue grant and TCP to this node does not send `OfflineMail
 | `QueueStore` log | `queue=<8 bytes hex> bucket=65536`. No recipient, no TCP peer |
 | Legacy PeerId slot | 7 days from accept. A store with no queue grant is inserted. The uploader PeerId is not stored |
 | One old `Store` frame | `Ack` when the letter is kept. An empty `OfflineMailboxDeliver` means the slot was refused |
-| Prekey | `PrekeyPut` is stored only when the Noise peer is the claimed owner and `void-envelope` accepts the signature, the expiry, and any one-time keys. At most 16 one-time keys. `PrekeyGet` removes one, erases it, and saves before the offer is returned. An id already handed out is not returned again. An expired signed prekey drops the rest of the pool |
+| Prekey | `PrekeyPut` is stored only when the Noise peer is the claimed owner and `void-envelope` accepts the signature, the expiry, and any one-time keys. At most 16 one-time keys. `PrekeyGet` removes one, erases it, and saves before the offer is returned. An empty pool still returns the signed prekey, with no one-time key. An id already handed out is not returned again. An expired signed prekey drops the rest of the pool |
 
 `relay_mailbox.bin` is encrypted with ChaCha20-Poly1305, key from `bootstrap_peer.key` (HKDF, `VOID_MAILBOX_v1`). The file label is `VRM3`; `VRM2` is still read. Queue slot names are `mailbox_slot` of the queue id in hex, not a PeerId. An operator who has `bootstrap_peer.key` can decrypt the file; someone who stole only the file cannot. After decryption a queue slot has the owner key, the write token, and the blobs — no recipient string.
 

@@ -557,6 +557,25 @@ fn undo_box(mail: &mut RelayMailbox, effect: BoxEffect) {
     }
 }
 
+/// Один `info` на очередь за две секунды. Пачка кусков не заливает журнал.
+fn log_queue_store(queue_id: &[u8; 32], bucket: u32) {
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<([u8; 8], Instant)>> = Mutex::new(None);
+    let mut key = [0u8; 8];
+    key.copy_from_slice(&queue_id[..8]);
+    let now = Instant::now();
+    let mut slot = LAST.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((prev, at)) = *slot {
+        if prev == key && now.saturating_duration_since(at) < Duration::from_secs(2) {
+            tracing::debug!("{}", queue_mail::queue_store_log(queue_id, bucket));
+            return;
+        }
+    }
+    *slot = Some((key, now));
+    tracing::info!("{}", queue_mail::queue_store_log(queue_id, bucket));
+}
+
 /// Same mailbox and queue operations as a direct `/void/chat` request.
 /// `authed` is the Noise peer. The onion exit passes `None`: a previous hop
 /// is not the owner, and its PeerId is not charged for the box.
@@ -631,7 +650,7 @@ fn box_response(
             let accepted = match mail.store(&queue_id, &proof, blob, now) {
                 crate::relay_mailbox::StoreResult::Stored { bucket } => {
                     let _ = mail.save();
-                    tracing::info!("{}", queue_mail::queue_store_log(&queue_id, bucket));
+                    log_queue_store(&queue_id, bucket);
                     true
                 }
                 crate::relay_mailbox::StoreResult::Duplicate { .. } => true,
@@ -853,7 +872,7 @@ fn dispatch_mail(
                     public_key: parts.public_key,
                     not_after: parts.not_after,
                     sig: parts.sig,
-                    opk: Some(parts.opk),
+                    opk: parts.opk,
                     kem_ek: parts.kem_ek,
                 }
             } else {
