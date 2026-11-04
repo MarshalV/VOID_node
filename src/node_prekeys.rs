@@ -316,6 +316,38 @@ mod tests {
     }
 
     #[test]
+    fn first_offer_has_one_opk_and_the_second_has_none() {
+        let dir = std::env::temp_dir().join(format!(
+            "void-prekeys-one-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let (mut store, kp, peer) = fresh(&dir);
+        let now = offline_mail::prekey_unix_now();
+        let owner = kp.public().to_peer_id();
+        let published = encode_signed_prekey(&kp, &owner, &[4u8; 32], now + 3600).unwrap();
+        assert!(store.put(
+            &peer,
+            published.pk,
+            published.not_after,
+            published.sig,
+            &[],
+            vec![opk(&kp, 7)],
+            now,
+        ));
+        let first = store.take(&peer, now).unwrap();
+        assert_eq!(first.opk.id, [7u8; 16]);
+        assert!(store.take(&peer, now).is_none());
+        drop(store);
+        let mut again = PrekeyDir::open(&dir.join(FILE_NAME), [9u8; 32]);
+        assert!(again.take(&peer, now).is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn expired_signed_prekey_drops_the_pool() {
         let dir = std::env::temp_dir().join(format!("void-prekeys-exp-{}", std::process::id()));
         let (mut store, kp, peer) = fresh(&dir);

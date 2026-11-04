@@ -1,16 +1,18 @@
 # VOID bootstrap / DNS-Seed node
 
-Version 0.4 — no web UI. The node asks for a network entry point in the
-terminal, then runs as:
+No web UI. The Rust crate version is 0.3.0. libp2p Identify advertises
+`void-bootstrap-node/0.4`. The encrypted seed handshake still puts
+`void-bootstrap-node/0.3` in `agent_version`. The node asks for a language,
+then for a network entry point, and runs as:
 
 1. **libp2p bootstrap / relay** (`/void/v1` + `/void/kad/1.0.0`) — TCP/UDP **4001** by default.
 2. **Offline mail / prekey** — store-and-forward on `/void/chat/1.0.0` (`relay_mailbox.bin`). The frame is JSON or CBOR; the `ct` body is opaque either way. The file on disk is encrypted (see [Offline mail](#offline-mail) and [Chat wire](#chat-wire)).
 3. **DNS-Seed server** — separate TCP port **4010**, hands other VOID nodes
-   an encrypted list of known peers over `VOID-SEED/v1`.
+   an encrypted list of known peers over `/void-seed/v1`.
 
 Seed exchange between nodes is inside AEAD (Ed25519 + PFS). **Client** libp2p traffic (Identify, Circuit Relay, mailbox) is a different layer: chat content is E2EE, routing metadata the node **does see**. This is not anonymous routing and not Tor.
 
-One such node is the normal mode for VOID (discovery, NAT, relay, mailbox). It does **not** hide the Alice ↔ Bob pair. An anonymous-routing layer is a separate plan, see below.
+One such node is the normal mode for VOID (discovery, NAT, relay, mailbox). On Circuit Relay it still sees the Alice ↔ Bob pair. The mailbox does not. Onion across several independent operators is a separate path, see below.
 
 ---
 
@@ -39,7 +41,9 @@ Binary: `target/release/void-bootstrap-node` (on Windows — `.exe`). On a small
 ./void-bootstrap-node
 ```
 
-On start you get a prompt (English locale shown):
+On a terminal the first prompt is the language (`en` / `ru` / `ch` / `fr`),
+unless `VOID_LANG` is set or `void.lang` already has a choice and stdin is
+not a TTY. The join prompt comes after the banner (English locale shown):
 
 ```
 === VOID bootstrap (seed + relay + DNS-Seed) ===
@@ -66,7 +70,7 @@ Enter another VOID node / DNS-Seed address: `198.51.100.10` or `198.51.100.10:40
 or `seed.example.com:4010`. The node then:
 
 1. opens a TCP connection,
-2. runs the encrypted `VOID-SEED/v1` handshake,
+2. runs the encrypted `/void-seed/v1` handshake,
 3. checks that the far side is a VOID node
    (Ed25519 signature over the ephemeral keys, PeerId, and timestamp),
 4. sends our known-peer list,
@@ -75,7 +79,9 @@ or `seed.example.com:4010`. The node then:
    runs `kad.bootstrap()` to build the DHT.
 
 The list is saved in `known_nodes.json` next to the binary, so later
-starts reconnect without asking again.
+starts reconnect without asking again. The name is unchanged, but the
+bytes are a sealed blob (`VNS1`, HKDF info `VOID_KNOWN_NODES_v1`). A
+plaintext file from an older build is read once and rewritten sealed.
 
 The first run also creates `bootstrap_peer.key` — **keep it safe**,
 it is your `PeerId` and the static Ed25519 key for the seed protocol.
@@ -94,6 +100,7 @@ it is your `PeerId` and the static Ed25519 key for the seed protocol.
 | `CLOUDPUB_CONFIG` | `~/.config/cloudpub/client.toml` | Path to CloudPub (`clo`) config |
 | `CLOUDPUB_AUTO_PUBLISH` | `0` | `1` — `clo register tcp …` + `clo run` for libp2p and seed |
 | `RUST_LOG` | `info` | tracing log level. |
+| `VOID_LANG` | — | Startup language: `en`, `ru`, `ch`, or `fr`. Otherwise `void.lang`, then the prompt |
 
 ## Protocol `/void-seed/v1` — on the wire
 
@@ -109,20 +116,25 @@ it is your `PeerId` and the static Ed25519 key for the seed protocol.
         |  msg3 = AEAD(k2, n=0, auth_c || request)      |
         | --------------------------------------------> |
         |                                               |
-        |  msg4 = AEAD(k2, n=1, peer_list)              |
+        |  msg4 = AEAD(k2, n=1, SeedDelivery)           |
         | <-------------------------------------------- |
 ```
 
 - Key exchange: ephemeral **X25519** (PFS, keys discarded after the session).
-- Key derivation: `HKDF-SHA-512` with `salt = "VOID-SEED/v1" || e_c || e_s` →
+- Key derivation: `HKDF-SHA-512` with `salt = "/void-seed/v1" || e_c || e_s` →
   64 bytes, first 32 are `k1`, next 32 are `k2`. All later messages
-  are `ChaCha20-Poly1305` (AEAD, 96-bit nonce = counter, `aad="VOID-SEED/v1"`).
+  are `ChaCha20-Poly1305` (AEAD, 96-bit nonce = counter, `aad="/void-seed/v1"`).
 - Authentication: the static `Ed25519` key (same as the libp2p `PeerId`)
-  on both sides signs `"VOID-SEED/v1|<dir>|e_c||e_s||own PeerId||timestamp"`;
+  on both sides signs `"/void-seed/v1|<dir>|e_c||e_s||own PeerId||timestamp"`;
   the client also appends the server PeerId. Timestamp is checked with a ±5 min window.
+  `agent_version` inside that AEAD is `void-bootstrap-node/0.3`. Identify uses `/0.4`.
   `protocol_version = "/void/v1"` inside AEAD is a version marker, not access
   control: any running instance of this program can produce it. An old node
   will not complete handshake with this signature.
+- msg4 plaintext is bincode `SeedDelivery`: `confirm_ts`, the server’s
+  Ed25519 confirmation over `"/void-seed/v1|both|…"`, and `SeedResponse`
+  (the peer list is inside `response`). A raw peer list does not finish
+  the handshake. The confirmation timestamp window is ±300 seconds.
 - A passive observer sees only 32 “random” bytes and then
   an encrypted stream. Neither PeerId, nor the node list, nor the
   `/void/v1` marker appears in the clear.
@@ -165,24 +177,24 @@ this node (Relay / Bootstrap)
 Bob
 ```
 
-At `RUST_LOG=info` (the default) and in process state the node can correlate:
+At `RUST_LOG=info` (the default) the process does not print a client PeerId, a client IP, or circuit `src` / `dst`. Those events are `debug`. The reservation itself still has both ends. This table is that view. It is not gossip.
 
 | Observation | Source |
 |-------------|--------|
-| Client IP + PeerId | `ConnectionEstablished` (`endpoint`) |
-| Alice ↔ Bob | `relay: circuit accepted` (`src` / `dst`) |
+| Client IP + PeerId | the Noise connection. `connection established` is `debug` and does not print them |
+| Alice ↔ Bob | Circuit Relay reservation. The node still has `src` and `dst`. `relay: circuit accepted` is `debug` and does not print them |
 | time and volume | connection duration, relay bytes |
-| offline queue | `QueueStore` log is `queue=` (first 8 bytes of the id) and the bucket size. The TCP peer is the previous hop and is not that line. A decrypted queue slot has no recipient string |
+| offline mail | a queue log is `queue=` (first 8 bytes of the id, hex) and `bucket=65536`. No recipient and no uploader. A PeerId slot names the recipient and the size; the connection PeerId is not stored as the uploader. That slot is returned only when the TCP peer is the recipient. `PrekeyGet` returns one one-time key and erases it. The pool is in `node_prekeys.bin`, not in the DHT value |
 
-E2EE protects content. One node does **not** give routing anonymity: `Alice → Node A → Bob` lets Node A link sender and recipient.
+E2EE protects content. The reservation row is the pair: `Alice → this node → Bob` still links sender and recipient. The mailbox row does not. A queue is not fetched because the TCP peer matches, and the uploader is not the connection PeerId.
 
 Several copies of this program under **one** operator are ≈ one node for trust. What matters is independence of operators, not process count.
 
 ## Offline mail
 
-New mail is a contact queue. `CreateQueue` registers `queue_id`, the owner public key, the write token, and the owner’s signature. `QueueStore` is one blob of exactly 64 KiB; the node checks the write proof before it stores the blob. `QueueChallengeRequest` / `QueueQuery` return `QueueDeliver` only after the owner signature on `VOID_QUEUE_QUERY_V1` matches. That check is outside the function that pops the batch.
+New mail is a contact queue. `CreateQueue` registers `queue_id`, the owner public key, the write token, and the owner’s signature. `QueueStore` is one blob of exactly 64 KiB; the node checks the write proof before it stores the blob. `QueueChallengeRequest` returns `QueueChallenge` or `Ack`. `QueueQuery` returns `QueueDeliver` only after the owner signature on `VOID_QUEUE_QUERY_V1` matches. That check is outside the function that pops the batch.
 
-A client with a live queue grant does not send `OfflineMailboxStore`. A store that still arrives is kept in the PeerId slot for 7 days, without the uploader id. That slot is readable only when `recipient` is the TCP peer. A foreign query gets an empty reply and does not touch the slot.
+A client with a live queue grant and TCP to this node does not send `OfflineMailboxStore`. A store that still arrives is kept in the PeerId slot for 7 days, without the uploader id. That slot is readable only when `recipient` is the TCP peer. A foreign query gets `Ack` and does not touch the slot. An onion exit passes no TCP owner, so it does not drain the slot either.
 
 | Rule | Value |
 |------|-------|
@@ -197,13 +209,13 @@ A client with a live queue grant does not send `OfflineMailboxStore`. A store th
 
 `relay_mailbox.bin` is encrypted with ChaCha20-Poly1305, key from `bootstrap_peer.key` (HKDF, `VOID_MAILBOX_v1`). The file label is `VRM3`; `VRM2` is still read. Queue slot names are `mailbox_slot` of the queue id in hex, not a PeerId. An operator who has `bootstrap_peer.key` can decrypt the file; someone who stole only the file cannot. After decryption a queue slot has the owner key, the write token, and the blobs — no recipient string.
 
-`node_prekeys.bin` uses the same AEAD and a different HKDF info, `VOID_PREKEY_v1`. The record is the signed prekey, `kem_ek`, and the one-time pool. A restart keeps what has not been handed out. Clients seal new mail to this prekey. The key derived from the recipient PeerId is only the fallback when no sealable prekey is published.
+`node_prekeys.bin` uses the same AEAD and a different HKDF info, `VOID_PREKEY_v1`. The record is the signed prekey, `kem_ek`, and the one-time pool. A restart keeps what has not been handed out. Clients seal new mail to this prekey. Without a sealable prekey the client does not build an envelope. The key derived from the recipient PeerId opens letters that were already sealed to it.
 
-Kademlia `put` on this node keeps two kinds of record and drops the rest: `/void/prekey/<PeerId>` with the owner’s signature and an expiry of at most 30 days, and `/void/mailbox/<PeerId>` as a bincode list of v3 envelopes. A one-time key (`/void/opk/`) is rejected before that check, so a reader of the DHT cannot take it. Provider records (`start_providing`) are unchanged. The remaining check is `void-kad-rules`, the same one the desktop uses.
+Kademlia `put` on this node keeps a signed `/void/prekey/<PeerId>` whose expiry is at most 30 days. A new `/void/mailbox/<PeerId>` put is refused: with contact queues that key would be a second mailbox addressed by PeerId. A mailbox record already in the store is not deleted and expires with its own TTL. There is no `/void/queue/` key. A one-time key (`/void/opk/`) is rejected and is not added to the prekey value. Provider records (`start_providing`) are unchanged. The value check for a prekey is `void-kad-rules`, the same one the desktop uses.
 
 ## Chat wire
 
-`/void/chat/1.0.0` carries the client's `V1Packet` from `void-frames` (Hello, queue, mailbox, prekey, onion, `Ack`). Request body at most 4 MiB, response at most 16 MiB. Field limits are the crate's.
+`/void/chat/1.0.0` carries the client's `V1Packet` from `void-frames` (Hello, queue, mailbox, prekey, onion, `Ack`). Request body at most 4 MiB, response at most 16 MiB. Field limits are the crate's. A frame this node does not serve closes the request and is not answered with `Ack`. The client already treats a mailbox `Ack` as a stored letter. `Hello` only records the CBOR bit. An inbound onion cell still gets a short `Ack`: the cell arrived.
 
 The node reads JSON and CBOR on every frame:
 
@@ -234,7 +246,9 @@ A repeat is not forwarded and is not run as the mailbox. v1 remembers the epheme
 
 The key is advertised in Identify: `void-bootstrap-node/0.4;onion=<64 hex>;osig=<hex>;epoch=<u64>;until=<unix>;op=<label>;osig2=<hex>;cbor=1`. `op` is `VOID_OPERATOR` (up to 32 bytes, no `;`). `;cbor=1` is always present on this build; older clients ignore the tag and keep sending JSON. The outer chat frame to the next hop is CBOR only if that hop announced the same capability. The v1 cell payload inside the seal stays JSON. The public key rotates every 7 days. `onion.key` stores the current secret and the previous one; the previous secret is deleted one day after its `not_after`. A 32-byte `onion.key` from an older build is kept as epoch 1 and given a 7-day expiry, so the advertised key does not jump on the first start. Identify’s agent string is fixed until restart; after a rotation the new descriptor is pushed in `BootstrapGossip`. File `onion.key` next to the binary — do not publish.
 
-One node still links the two ends: it sees Alice’s IP and Bob’s PeerId. Several **independent** operators are needed before entry and exit are different people. Several copies under one person ≈ one node. Set `VOID_OPERATOR` to a stable label so clients can avoid putting two of your nodes on one path.
+`BootstrapGossip` is the neighbor directory, not the mailbox. The node stores a neighbor’s address when the old hop-key signature checks out, even without a fresh v2 descriptor. An empty `sig2` sets `learned_epoch` to 0, and the addresses are still written. A fresh `sig2` is what updates epoch, expiry, and operator, and only when that epoch is not lower than the one already stored.
+
+A path of one hop still links the two ends: this process sees Alice’s IP and Bob’s PeerId. A middle hop does not. Several **independent** operators are needed before entry and exit are different people. Several copies under one person ≈ one node. Set `VOID_OPERATOR` to a stable label so clients can avoid putting two of your nodes on one path.
 
 Circuit Relay v2 is unchanged. Offline mail is the queue above; a PeerId box is only what `VRM2` still has left.
 
@@ -242,8 +256,9 @@ Circuit Relay v2 is unchanged. Offline mail is the queue above; a PeerId box is 
 
 - `bootstrap_peer.key` — static key. A leak lets someone impersonate
   your node in seed exchange. Keep backups and keep it secret.
-- `known_nodes.json` — public addresses. Not critical; add to `.gitignore`
-  if you want.
+- `known_nodes.json` — other nodes’ public addresses, sealed with
+  `bootstrap_peer.key` (`VOID_KNOWN_NODES_v1`). Without that key the file
+  does not read as JSON. Add it to `.gitignore` if you want.
 - `relay_mailbox.bin` — offline mail, encrypted with a key from `bootstrap_peer.key`. Together with the key it shows how many letters wait in each box. Do not publish or share.
 - `node_prekeys.bin` — signed prekeys and the one-time pool, encrypted with a different HKDF info (`VOID_PREKEY_v1`). Together with the key it shows which one-time keys are still unissued. Do not publish or share.
 - `onion.key` — hop key for `VOID_ONION_v1` and `v2`. A leak peels this node’s layer until the secret is erased (current key: 7 days, previous key: one day after that).
