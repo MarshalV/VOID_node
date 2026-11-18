@@ -62,35 +62,70 @@ async fn handle_conn(
     let mut session = hs.session;
     tracing::debug!("inbound seed handshake OK");
 
+    let slash = crate::sybil::slash16_of_ip(&remote_ip);
+    let token = slash.map(|net| {
+        state
+            .sybil
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .open(&peer_id_b58, net)
+    });
     let answer = match hs.request {
         SeedRequest::Exchange { offer, want_max } => {
-            let want = want_max.min(ANSWER_MAX).max(1) as usize;
-
-            let self_announced = offer
-                .iter()
-                .find(|e| e.peer_id_b58 == peer_id_b58)
-                .cloned();
-
-            let (added, _total) = state.store.merge(offer, &state.my_peer_id_b58).await;
-            if added > 0 {
-                tracing::debug!(added, "new seeds learned");
-            }
-
-            if let Some(adv) = self_announced {
-                state
-                    .store
-                    .touch(&peer_id_b58, &remote_ip, adv.seed_port, adv.libp2p_port)
-                    .await;
+            let allowed = state
+                .sybil
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .seed_write_allowed(&peer_id_b58, slash);
+            if !allowed {
+                let nonce = state
+                    .sybil
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .issue(&peer_id_b58);
+                SeedResponse::Sybil { nonce }
             } else {
-                state.store.touch(&peer_id_b58, &remote_ip, 0, 0).await;
+                merge_seed(&state, offer, want_max, &peer_id_b58, &remote_ip).await
             }
-
-            let mut mine = state.store.all().await;
-            mine.retain(|e| e.peer_id_b58 != peer_id_b58);
-            mine.truncate(want);
-            SeedResponse::Peers { peers: mine }
+        }
+        SeedRequest::Prove {
+            nonce,
+            sig,
+            offer,
+            want_max,
+        } => {
+            let proved = {
+                let mut gate = state.sybil.lock().unwrap_or_else(|e| e.into_inner());
+                if gate.take(&peer_id_b58, &nonce)
+                    && seed_protocol::verify_sybil(
+                        &hs.peer_auth.static_ed_pub,
+                        &hs.peer_auth.peer_id_bytes,
+                        &nonce,
+                        &sig,
+                    )
+                {
+                    gate.prove(&peer_id_b58);
+                    true
+                } else {
+                    false
+                }
+            };
+            if proved {
+                merge_seed(&state, offer, want_max, &peer_id_b58, &remote_ip).await
+            } else {
+                SeedResponse::Error {
+                    message: "sybil proof rejected".into(),
+                }
+            }
         }
     };
+    if let Some(token) = token {
+        state
+            .sybil
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .close(token);
+    }
 
     let pt = seed_protocol::encode_seed_delivery(
         &state.keypair,
@@ -104,6 +139,36 @@ async fn handle_conn(
     write_frame(&mut stream, &ct).await.context("msg4 write")?;
 
     Ok(())
+}
+
+async fn merge_seed(
+    state: &AppState,
+    offer: Vec<crate::seed_protocol::SeedEntry>,
+    want_max: u32,
+    peer_id_b58: &str,
+    remote_ip: &str,
+) -> SeedResponse {
+    let want = want_max.min(ANSWER_MAX).max(1) as usize;
+    let self_announced = offer
+        .iter()
+        .find(|e| e.peer_id_b58 == peer_id_b58)
+        .cloned();
+    let (added, _total) = state.store.merge(offer, &state.my_peer_id_b58).await;
+    if added > 0 {
+        tracing::debug!(added, "new seeds learned");
+    }
+    if let Some(adv) = self_announced {
+        state
+            .store
+            .touch(peer_id_b58, remote_ip, adv.seed_port, adv.libp2p_port)
+            .await;
+    } else {
+        state.store.touch(peer_id_b58, remote_ip, 0, 0).await;
+    }
+    let mut mine = state.store.all().await;
+    mine.retain(|e| e.peer_id_b58 != peer_id_b58);
+    mine.truncate(want);
+    SeedResponse::Peers { peers: mine }
 }
 
 /// Build our own SeedEntry describing how others should reach us.

@@ -80,6 +80,13 @@ pub struct SeedEntry {
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SeedRequest {
     Exchange { offer: Vec<SeedEntry>, want_max: u32 },
+    /// Повторный обмен, когда с одного /16 уже больше лимита TCP.
+    Prove {
+        nonce: [u8; 32],
+        sig: Vec<u8>,
+        offer: Vec<SeedEntry>,
+        want_max: u32,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +94,32 @@ pub enum SeedRequest {
 pub enum SeedResponse {
     Peers { peers: Vec<SeedEntry> },
     Error { message: String },
+    /// Одноразовый nonce. Клиент подписывает его ключом своего PeerId.
+    Sybil { nonce: [u8; 32] },
+}
+
+pub const SYBIL_PREFIX: &[u8] = b"VOID_SYBIL_PEER_v1\0";
+
+pub fn sybil_message(nonce: &[u8; 32], peer_id_bytes: &[u8]) -> Vec<u8> {
+    let mut message = SYBIL_PREFIX.to_vec();
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(peer_id_bytes);
+    message
+}
+
+pub fn sign_sybil(kp: &identity::Keypair, nonce: &[u8; 32]) -> Result<Vec<u8>> {
+    let message = sybil_message(nonce, &kp.public().to_peer_id().to_bytes());
+    kp.sign(&message).context("sybil sign")
+}
+
+pub fn verify_sybil(pk: &[u8; 32], peer_id_bytes: &[u8], nonce: &[u8; 32], sig: &[u8]) -> bool {
+    let Ok(vk) = VerifyingKey::from_bytes(pk) else {
+        return false;
+    };
+    let Ok(sig) = Signature::from_slice(sig) else {
+        return false;
+    };
+    vk.verify(&sybil_message(nonce, peer_id_bytes), &sig).is_ok()
 }
 
 /// msg4. Сервер подписывает оба PeerId и время. Клиент не принимает список без подписи.

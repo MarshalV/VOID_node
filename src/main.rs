@@ -35,6 +35,7 @@ mod seed_protocol;
 mod seed_server;
 mod state;
 mod storage;
+mod sybil;
 
 use futures::StreamExt;
 use libp2p::{
@@ -284,6 +285,22 @@ fn addr_is_unspecified(ma: &Multiaddr) -> bool {
 
 fn addr_is_quic(ma: &Multiaddr) -> bool {
     ma.to_string().contains("quic")
+}
+
+fn tcp_slash16(endpoint: &libp2p::core::ConnectedPoint) -> Option<[u8; 2]> {
+    let addr = match endpoint {
+        libp2p::core::ConnectedPoint::Dialer { address, .. } => address,
+        libp2p::core::ConnectedPoint::Listener { send_back_addr, .. } => send_back_addr,
+    };
+    if addr_is_quic(addr) {
+        return None;
+    }
+    for proto in addr.iter() {
+        if let Protocol::Ip4(ip) = proto {
+            return Some(crate::sybil::slash16_of_octets(ip.octets()));
+        }
+    }
+    None
 }
 
 fn remember_onion_peer(
@@ -577,11 +594,11 @@ fn log_queue_store(queue_id: &[u8; 32], bucket: u32) {
 }
 
 /// Same mailbox and queue operations as a direct `/void/chat` request.
-/// `authed` is the Noise peer. The onion exit passes `None`: a previous hop
-/// is not the owner, and its PeerId is not charged for the box.
+/// The Noise peer is not the owner. A PeerId slot opens after
+/// `VOID_MAILBOX_QUERY_v1`. The onion exit uses the same check.
 fn box_response(
     packet: V1Packet,
-    authed: Option<PeerId>,
+    _authed: Option<PeerId>,
     mail: &mut RelayMailbox,
 ) -> Option<BoxEffect> {
     let now = crate::relay_mailbox::now_secs();
@@ -600,15 +617,19 @@ fn box_response(
                 }))
             }
         }
-        V1Packet::OfflineMailboxQuery { recipient, .. } => {
-            let own = authed.is_some_and(|id| recipient.parse::<PeerId>().ok() == Some(id));
-            if !own {
-                if authed.is_some() {
-                    tracing::debug!("relay: mailbox query for foreign recipient denied");
-                }
+        V1Packet::MailboxChallengeRequest { recipient } => {
+            let Some((nonce, ts)) = mail.issue_mailbox_challenge(&recipient, now) else {
                 return Some(BoxEffect::bare(V1Packet::Ack));
-            }
-            let envs = mail.take_legacy(&recipient, batch, now);
+            };
+            Some(BoxEffect::bare(V1Packet::MailboxChallenge { nonce, ts }))
+        }
+        V1Packet::OfflineMailboxQuery {
+            recipient,
+            ts,
+            nonce,
+            sig,
+        } => {
+            let envs = mail.take_legacy_signed(&recipient, ts, &nonce, &sig, batch, now);
             if envs.is_empty() {
                 return Some(BoxEffect::bare(V1Packet::Ack));
             }
@@ -761,9 +782,16 @@ fn onion_try_forward(
     }
     let mut addrs = Vec::new();
     if let Some(peer) = onion_dir.get(&next) {
-        addrs.extend(peer.addrs.iter().cloned());
-        for addr in &peer.addrs {
-            swarm.behaviour_mut().kad.add_address(&next, addr.clone());
+        let now = crate::onion::unix_now();
+        let usable = match &peer.sig2 {
+            Some(_) => crate::onion::desc_fresh(peer.epoch, peer.not_after, now),
+            None => true,
+        };
+        if usable {
+            addrs.extend(peer.addrs.iter().cloned());
+            for addr in &peer.addrs {
+                swarm.behaviour_mut().kad.add_address(&next, addr.clone());
+            }
         }
     }
     addrs.extend(circuit_dial_addrs(self_addrs, next));
@@ -796,6 +824,7 @@ fn rr_class(packet: &V1Packet) -> RrClass {
     match packet {
         V1Packet::OfflineMailboxStore { .. }
         | V1Packet::OfflineMailboxQuery { .. }
+        | V1Packet::MailboxChallengeRequest { .. }
         | V1Packet::CreateQueue { .. }
         | V1Packet::QueueStore { .. }
         | V1Packet::QueueChallengeRequest { .. }
@@ -825,6 +854,7 @@ fn dispatch_mail(
     match packet {
         V1Packet::OfflineMailboxStore { .. }
         | V1Packet::OfflineMailboxQuery { .. }
+        | V1Packet::MailboxChallengeRequest { .. }
         | V1Packet::CreateQueue { .. }
         | V1Packet::QueueStore { .. }
         | V1Packet::QueueChallengeRequest { .. }
@@ -969,6 +999,8 @@ async fn dispatch_onion(
             send_rr_response(swarm, channel, cbor, V1Packet::Ack);
         }
         V1Packet::Onion2 { cell_b64 } => {
+            // Повтор v2 — OnionReplay на 14 суток, только память процесса.
+            // Кэш eph ветки Onion сюда не смотрит и на диск не пишется.
             let cell = crate::onion::b64_decode(&cell_b64);
             if let Some(cell) = cell {
                 let now = std::time::Instant::now();
@@ -1085,7 +1117,6 @@ async fn dispatch_onion(
                 if !crate::onion::verify_onion_pk_sig(pid, &pk, &sig) {
                     continue;
                 }
-                let addrs = hint.addrs.iter().filter_map(|s| s.parse::<Multiaddr>().ok());
                 let now = crate::onion::unix_now();
                 let sig2 = crate::onion::parse_hex_bytes(&hint.sig2_hex).filter(|s| {
                     crate::onion::desc_fresh(hint.epoch, hint.not_after, now)
@@ -1099,6 +1130,18 @@ async fn dispatch_onion(
                         )
                 });
                 let learned_epoch = if sig2.is_some() { hint.epoch } else { 0 };
+                let addrs: Vec<Multiaddr> = if sig2.is_some() {
+                    hint.addrs
+                        .iter()
+                        .filter_map(|s| s.parse::<Multiaddr>().ok())
+                        .filter(|ma| {
+                            !addr_is_quic(ma)
+                                && ma.iter().any(|p| matches!(p, Protocol::P2p(id) if id == pid))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
                 remember_onion_peer(
                     onion_dir,
                     pid,
@@ -1144,7 +1187,9 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .add_directive("libp2p_swarm=warn".parse().expect("swarm directive"))
+                .add_directive("libp2p::swarm=warn".parse().expect("swarm directive")),
         )
         .init();
 
@@ -1194,6 +1239,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         my_peer_id_b58: local_peer_id.to_base58(),
         store,
         reach: tokio::sync::RwLock::new(reach),
+        sybil: std::sync::Mutex::new(crate::sybil::SybilGate::default()),
     });
 
     println!();
@@ -1446,6 +1492,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut onion_v2_seen = void_onion::OnionReplay::new();
     let mut listen_addrs: Vec<Multiaddr> = Vec::new();
     let mut onion_gossiped: HashSet<PeerId> = HashSet::new();
+    let mut sybil_conns: HashMap<libp2p::swarm::ConnectionId, u64> = HashMap::new();
     tracing::info!("offline relay mailbox: {} slots on disk", relay_mail.slot_count());
 
     loop {
@@ -1547,11 +1594,39 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                         tracing::info!(%address, "listening");
                     }
-                    SwarmEvent::ConnectionEstablished { .. } => {
+                    SwarmEvent::ConnectionEstablished {
+                        peer_id,
+                        connection_id,
+                        endpoint,
+                        ..
+                    } => {
+                        if let Some(slash) = tcp_slash16(&endpoint) {
+                            let token = {
+                                let mut gate = app_state
+                                    .sybil
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner());
+                                gate.open(&peer_id.to_base58(), slash)
+                            };
+                            sybil_conns.insert(connection_id, token);
+                        }
                         tracing::debug!("connection established");
                     }
-                    SwarmEvent::ConnectionClosed { peer_id, num_established, .. } => {
+                    SwarmEvent::ConnectionClosed {
+                        peer_id,
+                        connection_id,
+                        num_established,
+                        ..
+                    } => {
+                        if let Some(token) = sybil_conns.remove(&connection_id) {
+                            app_state
+                                .sybil
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .close(token);
+                        }
                         tracing::debug!(remaining = num_established, "connection closed");
+                        // Очередь, слот PeerId и prekey остаются на диске до своего срока.
                         if num_established == 0 {
                             onion_gossiped.remove(&peer_id);
                             identified.remove(&peer_id);
@@ -1566,15 +1641,34 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         }
                         flush_pending_onion(&mut swarm, &mut pending_onion, peer_id, &cbor_peers);
                         let listen_copy = info.listen_addrs.clone();
-                        for addr in info.listen_addrs {
-                            swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
-                            if let Some(port) = tcp_port_from_multiaddr(&addr) {
-                                let pid_b58 = peer_id.to_base58();
-                                reconnect_state
-                                    .store
-                                    .update_libp2p_port(&pid_b58, port)
-                                    .await;
+                        let (into_kbucket, into_seed) = app_state
+                            .sybil
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .writes(&peer_id.to_base58());
+                        if into_kbucket {
+                            for addr in info.listen_addrs {
+                                swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
+                                if let Some(port) = tcp_port_from_multiaddr(&addr) {
+                                    let pid_b58 = peer_id.to_base58();
+                                    reconnect_state
+                                        .store
+                                        .update_libp2p_port(&pid_b58, port)
+                                        .await;
+                                }
                             }
+                        } else if into_seed {
+                            for addr in &info.listen_addrs {
+                                if let Some(port) = tcp_port_from_multiaddr(addr) {
+                                    reconnect_state
+                                        .store
+                                        .update_libp2p_port(&peer_id.to_base58(), port)
+                                        .await;
+                                }
+                            }
+                            tracing::debug!("sybil: known_nodes only, k-bucket skipped");
+                        } else {
+                            tracing::debug!("sybil: skip k-bucket and known_nodes");
                         }
                         if let Some(pk) = crate::onion::parse_pk_from_agent(&info.agent_version) {
                             let sig = crate::onion::parse_osig_from_agent(&info.agent_version)
@@ -1606,7 +1700,11 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                                     operator,
                                     sig2,
                                 },
-                                listen_copy,
+                                if into_kbucket {
+                                    listen_copy
+                                } else {
+                                    Vec::new()
+                                },
                             );
                             tracing::debug!("onion: learned hop key");
                             if is_new {

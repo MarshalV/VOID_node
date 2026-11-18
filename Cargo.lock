@@ -3343,7 +3343,6 @@ dependencies = [
 [[package]]
 name = "void-envelope"
 version = "0.1.0"
-source = "git+https://github.com/MarshalV/VOID.git?branch=spec#e4ad720df591592dc5f04aba5606fc8250b197e9"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3364,7 +3363,6 @@ dependencies = [
 [[package]]
 name = "void-frames"
 version = "0.1.0"
-source = "git+https://github.com/MarshalV/VOID.git?branch=spec#e4ad720df591592dc5f04aba5606fc8250b197e9"
 dependencies = [
  "anyhow",
  "blake2",
@@ -3383,7 +3381,6 @@ dependencies = [
 [[package]]
 name = "void-kad-rules"
 version = "0.1.0"
-source = "git+https://github.com/MarshalV/VOID.git?branch=spec#e4ad720df591592dc5f04aba5606fc8250b197e9"
 dependencies = [
  "void-envelope",
 ]
@@ -3391,7 +3388,6 @@ dependencies = [
 [[package]]
 name = "void-onion"
 version = "0.1.0"
-source = "git+https://github.com/MarshalV/VOID.git?branch=spec#e4ad720df591592dc5f04aba5606fc8250b197e9"
 dependencies = [
  "anyhow",
  "blake2",
@@ -3410,14 +3406,15 @@ dependencies = [
 [[package]]
 name = "void-session"
 version = "0.1.0"
-source = "git+https://github.com/MarshalV/VOID.git?branch=spec#e4ad720df591592dc5f04aba5606fc8250b197e9"
 dependencies = [
  "anyhow",
+ "bs58",
  "chacha20poly1305",
  "chrono",
  "hkdf",
  "libp2p-identity",
  "ml-kem",
+ "multihash",
  "rand 0.8.5",
  "serde",
  "serde_bytes",

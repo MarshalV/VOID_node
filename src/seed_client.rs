@@ -45,7 +45,10 @@ pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<Cont
     offer.insert(0, crate::seed_server::build_self_entry(&state).await);
     let sent = offer.len();
 
-    let request = SeedRequest::Exchange { offer, want_max: 256 };
+    let request = SeedRequest::Exchange {
+        offer: offer.clone(),
+        want_max: 256,
+    };
     let res = timeout(
         EXCHANGE_TIMEOUT,
         seed_protocol::client_exchange(&mut stream, &state.keypair, request),
@@ -53,10 +56,42 @@ pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<Cont
     .await
     .with_context(|| format!("handshake timeout to {addr}"))??;
 
+    let res = match res.response {
+        SeedResponse::Sybil { nonce } => {
+            let sig = seed_protocol::sign_sybil(&state.keypair, &nonce)?;
+            let prove = SeedRequest::Prove {
+                nonce,
+                sig,
+                offer,
+                want_max: 256,
+            };
+            let mut again = BufStream::new(
+                timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
+                    .await
+                    .with_context(|| format!("connect timeout to {addr}"))?
+                    .with_context(|| format!("connect to {addr}"))?,
+            );
+            timeout(
+                EXCHANGE_TIMEOUT,
+                seed_protocol::client_exchange(&mut again, &state.keypair, prove),
+            )
+            .await
+            .with_context(|| format!("sybil proof timeout to {addr}"))??
+        }
+        other => seed_protocol::ClientExchangeResult {
+            response: other,
+            peer_id_b58: res.peer_id_b58,
+            peer_auth: res.peer_auth,
+        },
+    };
+
     let mut peers = match res.response {
         SeedResponse::Peers { peers } => peers,
         SeedResponse::Error { message } => {
             return Err(anyhow!("remote rejected: {message}"));
+        }
+        SeedResponse::Sybil { .. } => {
+            return Err(anyhow!("remote rejected: sybil proof was not accepted"));
         }
     };
 

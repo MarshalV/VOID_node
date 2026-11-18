@@ -56,6 +56,14 @@ void-envelope = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" 
 void-onion = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
 void-kad-rules = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
 
+# This checkout runs the sibling VOID tree, so QueueDir is the local crate
+# and not a second copy pinned on the spec branch.
+[patch.'https://github.com/MarshalV/VOID.git']
+void-frames = { path = "../VOID/p2p-messenger/protocol/void-frames" }
+void-envelope = { path = "../VOID/p2p-messenger/protocol/void-envelope" }
+void-onion = { path = "../VOID/p2p-messenger/protocol/void-onion" }
+void-kad-rules = { path = "../VOID/p2p-messenger/protocol/void-kad-rules" }
+
 [features]
 default = []
 
