@@ -50,19 +50,11 @@ anyhow = "1"
 igd-next = "0.14"
 
 # Same frames, prekey rules, and onion peel as the desktop. Fetched from VOID
-# branch spec so a clone of this repo builds without a sibling checkout.
-void-frames = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
-void-envelope = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
-void-onion = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
-void-kad-rules = { git = "https://github.com/MarshalV/VOID.git", branch = "spec" }
-
-# This checkout runs the sibling VOID tree, so QueueDir is the local crate
-# and not a second copy pinned on the spec branch.
-[patch.'https://github.com/MarshalV/VOID.git']
-void-frames = { path = "../VOID/p2p-messenger/protocol/void-frames" }
-void-envelope = { path = "../VOID/p2p-messenger/protocol/void-envelope" }
-void-onion = { path = "../VOID/p2p-messenger/protocol/void-onion" }
-void-kad-rules = { path = "../VOID/p2p-messenger/protocol/void-kad-rules" }
+# branch queue_ so a clone of this repo builds without a sibling checkout.
+void-frames = { git = "https://github.com/MarshalV/VOID.git", branch = "queue_" }
+void-envelope = { git = "https://github.com/MarshalV/VOID.git", branch = "queue_" }
+void-onion = { git = "https://github.com/MarshalV/VOID.git", branch = "queue_" }
+void-kad-rules = { git = "https://github.com/MarshalV/VOID.git", branch = "queue_" }
 
 [features]
 default = []

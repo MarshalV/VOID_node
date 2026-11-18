@@ -31,7 +31,7 @@ cd bootstrap_node
 cargo build --release
 ```
 
-`Cargo.toml` names `void-frames`, `void-envelope`, `void-onion`, and `void-kad-rules` on the [VOID](https://github.com/MarshalV/VOID) branch `spec`. This checkout patches them to the sibling tree `../VOID/p2p-messenger/protocol`, so the mailbox runs that tree's `QueueDir`. The sibling has to be present for `cargo build`.
+`Cargo.toml` fetches `void-frames`, `void-envelope`, `void-onion`, and `void-kad-rules` from the [VOID](https://github.com/MarshalV/VOID) branch `queue_`. No sibling `../VOID` checkout is required.
 
 Binary: `target/release/void-bootstrap-node` (on Windows — `.exe`). On a small VPS, building `libp2p` is often killed by lack of RAM or disk: add swap (~2 GiB), use `cargo build --release -j 1`, and do not keep `target/debug` around at the same time.
 

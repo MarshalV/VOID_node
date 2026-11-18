@@ -3343,6 +3343,7 @@ dependencies = [
 [[package]]
 name = "void-envelope"
 version = "0.1.0"
+source = "git+https://github.com/MarshalV/VOID.git?branch=queue_#f806103a88def2ea2198b2e1f74e59221aa85838"
 dependencies = [
  "anyhow",
  "bincode",
@@ -3363,6 +3364,7 @@ dependencies = [
 [[package]]
 name = "void-frames"
 version = "0.1.0"
+source = "git+https://github.com/MarshalV/VOID.git?branch=queue_#f806103a88def2ea2198b2e1f74e59221aa85838"
 dependencies = [
  "anyhow",
  "blake2",
@@ -3381,6 +3383,7 @@ dependencies = [
 [[package]]
 name = "void-kad-rules"
 version = "0.1.0"
+source = "git+https://github.com/MarshalV/VOID.git?branch=queue_#f806103a88def2ea2198b2e1f74e59221aa85838"
 dependencies = [
  "void-envelope",
 ]
@@ -3388,6 +3391,7 @@ dependencies = [
 [[package]]
 name = "void-onion"
 version = "0.1.0"
+source = "git+https://github.com/MarshalV/VOID.git?branch=queue_#f806103a88def2ea2198b2e1f74e59221aa85838"
 dependencies = [
  "anyhow",
  "blake2",
@@ -3406,6 +3410,7 @@ dependencies = [
 [[package]]
 name = "void-session"
 version = "0.1.0"
+source = "git+https://github.com/MarshalV/VOID.git?branch=queue_#f806103a88def2ea2198b2e1f74e59221aa85838"
 dependencies = [
  "anyhow",
  "bs58",
