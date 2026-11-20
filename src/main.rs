@@ -922,8 +922,20 @@ fn dispatch_mail(
             send_rr_response(swarm, channel, cbor, response);
         }
         _ => {
-            drop(channel);
-            tracing::debug!("relay: unsupported frame, request closed");
+            // Клиент стукнулся в ноду хоть каким-то фреймом — отдаём ему всю
+            // накопленную офлайн-почту (legacy-слот для этого PeerId). Закрывает
+            // сценарий «Б заходит в сеть, но не шлёт QueueQuery/OfflineMailboxQuery».
+            let now = crate::relay_mailbox::now_secs();
+            let recipient = peer.to_string();
+            let mut envs = mail.take_legacy(&recipient, crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
+            if !envs.is_empty() {
+                let _ = mail.save();
+                tracing::debug!(count = envs.len(), %recipient, "relay: fallback deliver legacy mail on any client request");
+                send_rr_response(swarm, channel, cbor, V1Packet::OfflineMailboxDeliver { envelopes: envs });
+            } else {
+                drop(channel);
+                tracing::debug!("relay: unsupported frame, request closed");
+            }
         }
     }
 }
