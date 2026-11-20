@@ -1370,7 +1370,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
             let rr_config = libp2p::request_response::Config::default()
                 .with_request_timeout(Duration::from_secs(90))
-                .with_max_concurrent_streams(256);
+                .with_max_concurrent_streams(1024);
             let rr_codec = rr_codec::ChatCodec::new();
             let request_response = libp2p::request_response::Behaviour::with_codec(
                 rr_codec,
@@ -1843,6 +1843,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                         {
                             let inbound_cbor = request.cbor;
                             let request = request.packet;
+                            tracing::debug!(peer = %peer, ?request, "relay: inbound RR request");
                             if let V1Packet::Hello { caps, .. } = &request {
                                 if caps & HELLO_CAP_CBOR != 0 {
                                     cbor_peers.insert(peer);
