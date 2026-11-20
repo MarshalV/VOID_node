@@ -38,6 +38,7 @@ mod storage;
 mod sybil;
 
 use futures::StreamExt;
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, fmt};
 use libp2p::{
     autonat, identify, identity, kad, noise, ping, relay,
     multiaddr::Protocol,
@@ -46,6 +47,8 @@ use libp2p::{
 };
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
+use std::fs::OpenOptions;
+use std::io;
 use std::path::Path;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -700,11 +703,18 @@ fn box_response(
             nonce,
             sig,
         } => {
-            let blobs = if queue_query_ok(mail, &queue_id, ts, &nonce, &sig, now) {
+            let ok = queue_query_ok(mail, &queue_id, ts, &nonce, &sig, now);
+            let blobs = if ok {
                 mail.take_batch(&queue_id, batch, now)
             } else {
                 Vec::new()
             };
+            tracing::debug!(
+                queue = ?queue_id,
+                ok = ok,
+                count = blobs.len(),
+                "relay: queue query"
+            );
             if blobs.is_empty() {
                 return Some(BoxEffect::bare(V1Packet::Ack));
             }
@@ -1184,10 +1194,30 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     enable_utf8_stdio();
     let lang = prompt_language().await;
 
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("void.log")
+        .expect("open void.log");
+    let file_layer = fmt::layer()
+        .with_writer(move || log_file.try_clone().expect("clone log file"))
+        .with_ansi(false)
+        .with_target(true)
+        .with_level(true)
+        .with_thread_ids(true)
+        .with_file(true)
+        .with_line_number(true);
+    let console_layer = fmt::layer()
+        .with_writer(io::stdout)
+        .with_ansi(true)
+        .with_target(true)
+        .with_level(true);
+    tracing_subscriber::registry()
+        .with(file_layer)
+        .with(console_layer)
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info"))
                 .add_directive("libp2p_swarm=warn".parse().expect("swarm directive"))
                 .add_directive("libp2p::swarm=warn".parse().expect("swarm directive")),
         )
