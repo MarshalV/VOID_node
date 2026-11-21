@@ -927,8 +927,8 @@ fn dispatch_mail(
             // Закрывает сценарий «Б заходит в сеть, но не шлёт QueueQuery/OfflineMailboxQuery».
             let now = crate::relay_mailbox::now_secs();
             let recipient = peer.to_string();
-            let mut envs = mail.take_legacy(&recipient, crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
-            let mut blobs = mail.take_all_queues(crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
+            let envs = mail.take_legacy(&recipient, crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
+            let blobs = mail.take_all_queues(crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
             if !envs.is_empty() || !blobs.is_empty() {
                 let _ = mail.save();
                 tracing::debug!(count = envs.len(), blobs = blobs.len(), %recipient, "relay: fallback deliver all mail on any client request");

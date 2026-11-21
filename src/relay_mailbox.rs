@@ -8,7 +8,7 @@
 //! a live grant does not send that copy. A store that still arrives (no grant,
 //! or a peer without the bit) is kept here, without the uploader PeerId.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
