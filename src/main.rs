@@ -727,6 +727,7 @@ fn box_response(
                 restore_legacy: None,
             })
         }
+        _ => None,
     }
 }
 
