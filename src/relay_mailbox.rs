@@ -115,6 +115,8 @@ pub(crate) struct RelayMailbox {
     /// VRM3 slots. Adopted into `dir` on the first frame that names `queue_id`.
     pending: HashMap<String, QueueSlot>,
     legacy: HashMap<String, Vec<StoredEnvelope>>,
+    /// Все queue_id, которые эта нода когда-либо принимала — для отдачи при подключении клиента.
+    known_queues: HashSet<[u8; 32]>,
     /// Nonces for `VOID_MAILBOX_QUERY_v1`. Process memory; a restart clears them.
     mailbox_challenges: ChallengeBook,
 }
@@ -148,6 +150,7 @@ impl RelayMailbox {
             dir: QueueDir::new(),
             pending: HashMap::new(),
             legacy: HashMap::new(),
+            known_queues: HashSet::new(),
             mailbox_challenges: ChallengeBook::new(),
         }
     }
@@ -285,6 +288,7 @@ impl RelayMailbox {
         now: u64,
     ) -> bool {
         self.adopt(&queue_id, now);
+        self.known_queues.insert(queue_id);
         self.dir
             .create(queue_id, owner_pk, write_token, expiry, sig, now)
     }
@@ -299,6 +303,7 @@ impl RelayMailbox {
         now: u64,
     ) -> StoreResult {
         self.adopt(queue_id, now);
+        self.known_queues.insert(*queue_id);
         match self.dir.store(*queue_id, proof, blob, now) {
             Some(stored) if stored.fresh => StoreResult::Stored {
                 bucket: stored.bucket,
@@ -344,6 +349,33 @@ impl RelayMailbox {
     ) -> Vec<Vec<u8>> {
         self.adopt(queue_id, now);
         self.dir.take_batch(*queue_id, max_plain_bytes, now)
+    }
+
+    /// Отдаёт блобы из всех известных очередей (включая аудио-очереди) и очищает их.
+    /// Используется при подключении клиента, который не шлёт `QueueQuery`.
+    pub(crate) fn take_all_queues(
+        &mut self,
+        max_plain_bytes: usize,
+        now: u64,
+    ) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        let mut used = 0usize;
+        let ids: Vec<[u8; 32]> = self.known_queues.iter().copied().collect();
+        for queue_id in ids {
+            if used >= max_plain_bytes {
+                break;
+            }
+            let blobs = self.take_batch(&queue_id, max_plain_bytes.saturating_sub(used), now);
+            for blob in blobs {
+                let n = blob.len();
+                if !out.is_empty() && used.saturating_add(n) > max_plain_bytes {
+                    break;
+                }
+                out.push(blob);
+                used = used.saturating_add(n);
+            }
+        }
+        out
     }
 
     /// PeerId copy from a client that has no queue grant. The uploader is not stored.
