@@ -538,11 +538,12 @@ fn send_rr_response(
     channel: libp2p::request_response::ResponseChannel<rr_codec::WireMsg>,
     cbor: bool,
     packet: V1Packet,
-) {
-    let _ = swarm.behaviour_mut().request_response.send_response(
-        channel,
-        rr_codec::WireMsg { packet, cbor },
-    );
+) -> bool {
+    swarm
+        .behaviour_mut()
+        .request_response
+        .send_response(channel, rr_codec::WireMsg { packet, cbor })
+        .is_ok()
 }
 
 struct BoxEffect {
@@ -874,7 +875,21 @@ fn dispatch_mail(
                 tracing::debug!("relay: mail frame produced no response");
                 return;
             };
-            send_rr_response(swarm, channel, cbor, effect.response);
+            let BoxEffect {
+                response,
+                restore_queue,
+                restore_legacy,
+            } = effect;
+            if !send_rr_response(swarm, channel, cbor, response) {
+                undo_box(
+                    mail,
+                    BoxEffect {
+                        response: V1Packet::Ack,
+                        restore_queue,
+                        restore_legacy,
+                    },
+                );
+            }
         }
         V1Packet::PrekeyPut {
             peer_id,

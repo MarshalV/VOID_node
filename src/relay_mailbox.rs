@@ -83,6 +83,17 @@ struct RelayFileV4 {
     legacy: HashMap<String, Vec<StoredEnvelope>>,
 }
 
+/// Same field order as `void_envelope::queue_mail::StoredQueue`; `QueueDir`
+/// keeps that type private, while the relay needs its IDs for fallback delivery.
+#[derive(Deserialize)]
+struct QueueIndexDisk {
+    queue_id: [u8; 32],
+    _owner_pk: Vec<u8>,
+    _write_token: [u8; 32],
+    _expiry: u64,
+    _blobs: Vec<Vec<u8>>,
+}
+
 #[derive(Default, Serialize, Deserialize)]
 struct RelayDataV2 {
     #[serde(default)]
@@ -158,6 +169,11 @@ impl RelayMailbox {
     fn ingest(&mut self, plain: &[u8], now: u64) {
         if let Some(body) = plain.strip_prefix(FORMAT_V4.as_slice()) {
             let file = bincode::deserialize::<RelayFileV4>(body).unwrap_or_default();
+            self.known_queues = bincode::deserialize::<Vec<QueueIndexDisk>>(&file.dir)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|queue| queue.queue_id)
+                .collect();
             self.dir = QueueDir::import(&file.dir);
             self.pending = slots_from_disk(file.pending);
             self.legacy = file.legacy;
