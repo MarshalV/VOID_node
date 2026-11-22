@@ -710,7 +710,7 @@ fn box_response(
             } else {
                 Vec::new()
             };
-            tracing::debug!(
+            tracing::info!(
                 queue = ?queue_id,
                 ok = ok,
                 count = blobs.len(),
