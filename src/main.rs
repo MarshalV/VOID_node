@@ -550,6 +550,7 @@ struct BoxEffect {
     response: V1Packet,
     restore_queue: Option<([u8; 32], Vec<Vec<u8>>)>,
     restore_legacy: Option<(String, Vec<OfflineEnvelope>)>,
+    cancel_lease: Option<(String, [u8; 16])>,
 }
 
 impl BoxEffect {
@@ -558,6 +559,7 @@ impl BoxEffect {
             response,
             restore_queue: None,
             restore_legacy: None,
+            cancel_lease: None,
         }
     }
 }
@@ -572,6 +574,9 @@ fn undo_box(mail: &mut RelayMailbox, effect: BoxEffect) {
     if let Some((recipient, envs)) = effect.restore_legacy {
         mail.restore_legacy(&recipient, envs, now);
         changed = true;
+    }
+    if let Some((recipient, lease_id)) = effect.cancel_lease {
+        changed |= mail.cancel_lease(&recipient, &lease_id, now);
     }
     if changed {
         let _ = mail.save();
@@ -617,35 +622,68 @@ fn box_response(
                 Some(BoxEffect::bare(V1Packet::Ack))
             } else {
                 Some(BoxEffect::bare(V1Packet::OfflineMailboxDeliver {
-                    envelopes: Vec::new(),
+                    envelopes: Vec::new(), lease_id: None, ack_nonce: None, ack_ts: None,
                 }))
             }
         }
-        V1Packet::MailboxChallengeRequest { recipient } => {
+        V1Packet::MailboxChallengeRequest { recipient, lease } => {
             let Some((nonce, ts)) = mail.issue_mailbox_challenge(&recipient, now) else {
                 return Some(BoxEffect::bare(V1Packet::Ack));
             };
-            Some(BoxEffect::bare(V1Packet::MailboxChallenge { nonce, ts }))
+            Some(BoxEffect::bare(V1Packet::MailboxChallenge { nonce, ts, lease }))
         }
         V1Packet::OfflineMailboxQuery {
             recipient,
             ts,
             nonce,
             sig,
+            lease,
         } => {
-            let envs = mail.take_legacy_signed(&recipient, ts, &nonce, &sig, batch, now);
-            if envs.is_empty() {
-                return Some(BoxEffect::bare(V1Packet::Ack));
+            if lease {
+                let Some((lease_id, _expires_at, ack_nonce, envelopes)) =
+                    mail.lease_legacy_signed(&recipient, ts, &nonce, &sig, batch, now)
+                else {
+                    return Some(BoxEffect::bare(V1Packet::Ack));
+                };
+                if let Err(error) = mail.save() {
+                    mail.restore_legacy(&recipient, envelopes, now);
+                    tracing::warn!("mailbox lease persistence failed: {error}");
+                    return Some(BoxEffect::bare(V1Packet::OfflineMailboxDeliver {
+                        envelopes: Vec::new(), lease_id: None, ack_nonce: None, ack_ts: None,
+                    }));
+                }
+                Some(BoxEffect {
+                    response: V1Packet::OfflineMailboxDeliver {
+                        envelopes,
+                        lease_id: Some(lease_id),
+                        ack_nonce: Some(ack_nonce),
+                        ack_ts: Some(now),
+                    },
+                    restore_queue: None,
+                    restore_legacy: None,
+                    cancel_lease: Some((recipient, lease_id)),
+                })
+            } else {
+                let envs = mail.take_legacy_signed(&recipient, ts, &nonce, &sig, batch, now);
+                if envs.is_empty() {
+                    return Some(BoxEffect::bare(V1Packet::Ack));
+                }
+                let _ = mail.save();
+                Some(BoxEffect {
+                    response: V1Packet::OfflineMailboxDeliver {
+                        envelopes: envs.clone(), lease_id: None, ack_nonce: None, ack_ts: None,
+                    },
+                    restore_queue: None,
+                    restore_legacy: Some((recipient, envs)),
+                    cancel_lease: None,
+                })
             }
-            let _ = mail.save();
-            tracing::debug!(count = envs.len(), "relay: delivering legacy mail batch");
-            Some(BoxEffect {
-                response: V1Packet::OfflineMailboxDeliver {
-                    envelopes: envs.clone(),
-                },
-                restore_queue: None,
-                restore_legacy: Some((recipient, envs)),
-            })
+        }
+        V1Packet::OfflineMailboxAck { recipient, lease_id, ts, nonce, sig } => {
+            if mail.ack_legacy(&recipient, &lease_id, ts, &nonce, &sig, now) {
+                let _ = mail.save();
+            }
+            Some(BoxEffect::bare(V1Packet::Ack))
         }
         V1Packet::CreateQueue {
             queue_id,
@@ -726,6 +764,7 @@ fn box_response(
                 },
                 restore_queue: Some((queue_id, blobs)),
                 restore_legacy: None,
+                cancel_lease: None,
             })
         }
         _ => None,
@@ -836,6 +875,7 @@ fn rr_class(packet: &V1Packet) -> RrClass {
         V1Packet::OfflineMailboxStore { .. }
         | V1Packet::OfflineMailboxQuery { .. }
         | V1Packet::MailboxChallengeRequest { .. }
+        | V1Packet::OfflineMailboxAck { .. }
         | V1Packet::CreateQueue { .. }
         | V1Packet::QueueStore { .. }
         | V1Packet::QueueChallengeRequest { .. }
@@ -866,6 +906,7 @@ fn dispatch_mail(
         V1Packet::OfflineMailboxStore { .. }
         | V1Packet::OfflineMailboxQuery { .. }
         | V1Packet::MailboxChallengeRequest { .. }
+        | V1Packet::OfflineMailboxAck { .. }
         | V1Packet::CreateQueue { .. }
         | V1Packet::QueueStore { .. }
         | V1Packet::QueueChallengeRequest { .. }
@@ -879,6 +920,7 @@ fn dispatch_mail(
                 response,
                 restore_queue,
                 restore_legacy,
+                cancel_lease,
             } = effect;
             if !send_rr_response(swarm, channel, cbor, response) {
                 undo_box(
@@ -887,6 +929,7 @@ fn dispatch_mail(
                         response: V1Packet::Ack,
                         restore_queue,
                         restore_legacy,
+                        cancel_lease,
                     },
                 );
             }
@@ -937,9 +980,8 @@ fn dispatch_mail(
             send_rr_response(swarm, channel, cbor, response);
         }
         _ => {
-            // Клиент стукнулся в ноду хоть каким-то фреймом — отдаём ему всю
-            // накопленную офлайн-почту (legacy-слот + все очереди, включая аудио).
-            // Закрывает сценарий «Б заходит в сеть, но не шлёт QueueQuery/OfflineMailboxQuery».
+            // Queue fallback remains available. PeerId mailbox data is only
+            // released through the signed, leased OfflineMailboxQuery path.
             let now = crate::relay_mailbox::now_secs();
             let recipient = peer.to_string();
             let blobs = mail.take_all_queues(crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
@@ -948,15 +990,8 @@ fn dispatch_mail(
                 tracing::debug!(blobs = blobs.len(), %recipient, "relay: fallback deliver queues on any client request");
                 send_rr_response(swarm, channel, cbor, V1Packet::QueueDeliver { blobs });
             } else {
-                let envs = mail.take_legacy(&recipient, crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
-                if !envs.is_empty() {
-                    let _ = mail.save();
-                    tracing::debug!(count = envs.len(), %recipient, "relay: fallback deliver legacy mail on any client request");
-                    send_rr_response(swarm, channel, cbor, V1Packet::OfflineMailboxDeliver { envelopes: envs });
-                } else {
-                    drop(channel);
-                    tracing::debug!("relay: unsupported frame, request closed");
-                }
+                drop(channel);
+                tracing::debug!("relay: unsupported frame, request closed");
             }
         }
     }

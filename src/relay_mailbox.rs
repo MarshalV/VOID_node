@@ -9,6 +9,7 @@
 //! or a peer without the bit) is kept here, without the uploader PeerId.
 
 use std::collections::{HashMap, HashSet};
+use rand::RngCore;
 use std::error::Error;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -27,6 +28,8 @@ const FORMAT_V2: &[u8; 4] = b"VRM2";
 const FORMAT_V3: &[u8; 4] = b"VRM3";
 /// `QueueDir` export plus any VRM3 slots not adopted yet, and PeerId leftovers.
 const FORMAT_V4: &[u8; 4] = b"VRM4";
+const FORMAT_V5: &[u8; 4] = b"VRM5";
+pub(crate) const MAILBOX_LEASE_SECS: u64 = 5 * 60;
 
 /// PeerId slots loaded from VRM2. Same lifetime as the old client DHT record.
 const LEGACY_TTL_SECS: u64 = 7 * 24 * 3600;
@@ -83,6 +86,26 @@ struct RelayFileV4 {
     legacy: HashMap<String, Vec<StoredEnvelope>>,
 }
 
+#[derive(Clone, Serialize, Deserialize)]
+struct LeasedBatch {
+    lease_id: [u8; 16],
+    expires_at: u64,
+    ack_nonce: [u8; 32],
+    envelopes: Vec<StoredEnvelope>,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct RelayFileV5 {
+    #[serde(default)]
+    dir: Vec<u8>,
+    #[serde(default)]
+    pending: HashMap<String, QueueDisk>,
+    #[serde(default)]
+    legacy: HashMap<String, Vec<StoredEnvelope>>,
+    #[serde(default)]
+    leases: HashMap<String, Vec<LeasedBatch>>,
+}
+
 /// Same field order as `void_envelope::queue_mail::StoredQueue`; `QueueDir`
 /// keeps that type private, while the relay needs its IDs for fallback delivery.
 #[derive(Deserialize)]
@@ -126,6 +149,7 @@ pub(crate) struct RelayMailbox {
     /// VRM3 slots. Adopted into `dir` on the first frame that names `queue_id`.
     pending: HashMap<String, QueueSlot>,
     legacy: HashMap<String, Vec<StoredEnvelope>>,
+    leases: HashMap<String, Vec<LeasedBatch>>,
     /// Все queue_id, которые эта нода когда-либо принимала — для отдачи при подключении клиента.
     known_queues: HashSet<[u8; 32]>,
     /// Nonces for `VOID_MAILBOX_QUERY_v1`. Process memory; a restart clears them.
@@ -161,13 +185,22 @@ impl RelayMailbox {
             dir: QueueDir::new(),
             pending: HashMap::new(),
             legacy: HashMap::new(),
+            leases: HashMap::new(),
             known_queues: HashSet::new(),
             mailbox_challenges: ChallengeBook::new(),
         }
     }
 
     fn ingest(&mut self, plain: &[u8], now: u64) {
-        if let Some(body) = plain.strip_prefix(FORMAT_V4.as_slice()) {
+        if let Some(body) = plain.strip_prefix(FORMAT_V5.as_slice()) {
+            let file = bincode::deserialize::<RelayFileV5>(body).unwrap_or_default();
+            self.known_queues = bincode::deserialize::<Vec<QueueIndexDisk>>(&file.dir)
+                .unwrap_or_default().into_iter().map(|queue| queue.queue_id).collect();
+            self.dir = QueueDir::import(&file.dir);
+            self.pending = slots_from_disk(file.pending);
+            self.legacy = file.legacy;
+            self.leases = file.leases;
+        } else if let Some(body) = plain.strip_prefix(FORMAT_V4.as_slice()) {
             let file = bincode::deserialize::<RelayFileV4>(body).unwrap_or_default();
             self.known_queues = bincode::deserialize::<Vec<QueueIndexDisk>>(&file.dir)
                 .unwrap_or_default()
@@ -177,19 +210,23 @@ impl RelayMailbox {
             self.dir = QueueDir::import(&file.dir);
             self.pending = slots_from_disk(file.pending);
             self.legacy = file.legacy;
+            self.leases.clear();
         } else if let Some(body) = plain.strip_prefix(FORMAT_V3.as_slice()) {
             let file = bincode::deserialize::<RelayFileV3>(body).unwrap_or_default();
             self.pending = slots_from_disk(file.queues);
             self.legacy = file.legacy;
+            self.leases.clear();
         } else if let Some(body) = plain.strip_prefix(FORMAT_V2.as_slice()) {
             self.legacy = bincode::deserialize::<RelayDataV2>(body)
                 .map(|d| d.by_recipient)
                 .unwrap_or_default();
+            self.leases.clear();
         } else {
             let legacy = bincode::deserialize::<LegacyRelayData>(plain)
                 .or_else(|_| serde_json::from_slice::<LegacyRelayData>(plain))
                 .map(|d| d.by_recipient)
                 .unwrap_or_default();
+            self.leases.clear();
             let legacy = match self.seal_key.as_ref() {
                 Some(key) => remap_slots(legacy, key),
                 None => legacy,
@@ -213,7 +250,7 @@ impl RelayMailbox {
     }
 
     pub(crate) fn save(&self) -> Result<(), Box<dyn Error>> {
-        let data = RelayFileV4 {
+        let data = RelayFileV5 {
             dir: self.dir.export(),
             pending: self
                 .pending
@@ -231,8 +268,9 @@ impl RelayMailbox {
                 })
                 .collect(),
             legacy: self.legacy.clone(),
+            leases: self.leases.clone(),
         };
-        let mut bytes = FORMAT_V4.to_vec();
+        let mut bytes = FORMAT_V5.to_vec();
         bytes.extend_from_slice(&bincode::serialize(&data)?);
         if let Some(key) = self.seal_key.as_ref() {
             bytes = crate::seal::seal(key, &bytes)?;
@@ -250,11 +288,11 @@ impl RelayMailbox {
     }
 
     pub(crate) fn slot_count(&self) -> usize {
-        self.dir.len() + self.pending.len() + self.legacy.len()
+        self.dir.len() + self.pending.len() + self.legacy.len() + self.leases.len()
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.dir.is_empty() && self.pending.is_empty() && self.legacy.is_empty()
+        self.dir.is_empty() && self.pending.is_empty() && self.legacy.is_empty() && self.leases.is_empty()
     }
 
     /// Drop expired queues and VRM2 letters. `true` if anything was removed.
@@ -272,6 +310,24 @@ impl RelayMailbox {
             changed |= slot.letters.len() != before;
             true
         });
+        for (slot_key, batches) in self.leases.iter_mut() {
+            let mut index = 0;
+            while index < batches.len() {
+                if batches[index].expires_at <= now {
+                    let batch = batches.remove(index);
+                    let slot = self.legacy.entry(slot_key.clone()).or_default();
+                    for item in batch.envelopes.into_iter().rev() {
+                        if !slot.iter().any(|have| have.env.message_id == item.env.message_id) {
+                            slot.insert(0, item);
+                        }
+                    }
+                    changed = true;
+                } else {
+                    index += 1;
+                }
+            }
+        }
+        self.leases.retain(|_, batches| !batches.is_empty());
         self.legacy.retain(|_, slot| {
             let before = slot.len();
             slot.retain(|s| now.saturating_sub(s.stored_at) < LEGACY_TTL_SECS);
@@ -279,6 +335,11 @@ impl RelayMailbox {
             !slot.is_empty()
         });
         changed
+    }
+
+    #[cfg(test)]
+    fn expire_for_test(&mut self, now: u64) -> bool {
+        self.purge_expired(now)
     }
 
     fn adopt(&mut self, queue_id: &[u8; 32], now: u64) {
@@ -501,6 +562,94 @@ impl RelayMailbox {
         self.take_legacy(recipient, max_plain_bytes, now)
     }
 
+    pub(crate) fn lease_legacy_signed(
+        &mut self,
+        recipient: &str,
+        ts: u64,
+        query_nonce: &[u8; 32],
+        sig: &[u8],
+        max_plain_bytes: usize,
+        now: u64,
+    ) -> Option<([u8; 16], u64, [u8; 32], Vec<OfflineEnvelope>)> {
+        let id: libp2p::PeerId = recipient.parse().ok()?;
+        if !self.mailbox_challenges.authorize(&id, ts, query_nonce, sig, now) {
+            return None;
+        }
+        self.purge_expired(now);
+        let slot_key = self.legacy_slot(recipient);
+        let slot = self.legacy.get_mut(&slot_key)?;
+        let mut leased = Vec::new();
+        let mut used = 0usize;
+        while let Some(item) = slot.first() {
+            let bytes = envelope_len(&item.env);
+            if !leased.is_empty() && used.saturating_add(bytes) > max_plain_bytes {
+                break;
+            }
+            used = used.saturating_add(bytes);
+            leased.push(slot.remove(0));
+            if used >= max_plain_bytes {
+                break;
+            }
+        }
+        if leased.is_empty() {
+            return None;
+        }
+        if slot.is_empty() {
+            self.legacy.remove(&slot_key);
+        }
+        let mut lease_id = [0u8; 16];
+        rand::rngs::OsRng.fill_bytes(&mut lease_id);
+        let mut ack_nonce = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut ack_nonce);
+        let expires_at = now.saturating_add(MAILBOX_LEASE_SECS);
+        let envelopes = leased.iter().map(|item| item.env.clone()).collect();
+        self.leases.entry(slot_key).or_default().push(LeasedBatch {
+            lease_id, expires_at, ack_nonce, envelopes: leased,
+        });
+        Some((lease_id, expires_at, ack_nonce, envelopes))
+    }
+
+    pub(crate) fn cancel_lease(&mut self, recipient: &str, lease_id: &[u8; 16], now: u64) -> bool {
+        let slot_key = self.legacy_slot(recipient);
+        let Some(batches) = self.leases.get_mut(&slot_key) else { return false; };
+        let Some(index) = batches.iter().position(|batch| batch.lease_id == *lease_id) else { return false; };
+        let batch = batches.remove(index);
+        let slot = self.legacy.entry(slot_key.clone()).or_default();
+        for item in batch.envelopes.into_iter().rev() {
+            if !slot.iter().any(|have| have.env.message_id == item.env.message_id) {
+                slot.insert(0, item);
+            }
+        }
+        if batches.is_empty() { self.leases.remove(&slot_key); }
+        let _ = now;
+        true
+    }
+
+    pub(crate) fn ack_legacy(
+        &mut self,
+        recipient: &str,
+        lease_id: &[u8; 16],
+        ts: u64,
+        ack_nonce: &[u8; 32],
+        sig: &[u8],
+        now: u64,
+    ) -> bool {
+        let Ok(peer) = recipient.parse::<libp2p::PeerId>() else { return false; };
+        let slot_key = self.legacy_slot(recipient);
+        let Some(batches) = self.leases.get_mut(&slot_key) else { return false; };
+        let Some(index) = batches.iter().position(|batch| batch.lease_id == *lease_id) else { return false; };
+        let batch = &batches[index];
+        if batch.expires_at <= now || batch.ack_nonce != *ack_nonce || ts.abs_diff(now) > 120 {
+            return false;
+        }
+        if !void_frames::protocol::verify_mailbox_ack(&peer, lease_id, ts, ack_nonce, sig) {
+            return false;
+        }
+        batches.remove(index);
+        if batches.is_empty() { self.leases.remove(&slot_key); }
+        true
+    }
+
     /// Put a query batch back when the onion reply could not be sent.
     pub(crate) fn restore_queue(&mut self, queue_id: &[u8; 32], blobs: Vec<Vec<u8>>, now: u64) {
         if blobs.is_empty() {
@@ -699,6 +848,59 @@ mod tests {
         let got = mail.take_legacy("bob", 1 << 20, now);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].message_id, "m1");
+    }
+
+    #[test]
+    fn leased_batch_requires_signed_ack_or_is_requeued_after_expiry() {
+        use libp2p::identity::Keypair;
+
+        let now = 1_700_000_000u64;
+        let owner = Keypair::generate_ed25519();
+        let peer = libp2p::PeerId::from_public_key(&owner.public());
+        let recipient = peer.to_string();
+        let mut mail = RelayMailbox::empty(None);
+        assert!(mail.accept_legacy(&recipient, vec![env("mail-1")], now));
+        let (query_nonce, query_ts) = mail.issue_mailbox_challenge(&recipient, now).unwrap();
+        let query_sig = void_frames::protocol::sign_mailbox_query(
+            &owner, &peer, query_ts, &query_nonce,
+        ).unwrap();
+        let (lease_id, _expires_at, _ack_nonce, delivered) = mail.lease_legacy_signed(
+            &recipient, query_ts, &query_nonce, &query_sig, 1 << 20, now,
+        ).unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert!(mail.legacy.get(&mail.legacy_slot(&recipient)).is_none());
+        assert!(!mail.ack_legacy(
+            &recipient, &lease_id, now, &[3u8; 32], &[], now,
+        ));
+        assert!(mail.expire_for_test(now + MAILBOX_LEASE_SECS));
+        assert_eq!(mail.take_legacy(&recipient, 1 << 20, now + MAILBOX_LEASE_SECS).len(), 1);
+
+        assert!(mail.accept_legacy(&recipient, vec![env("mail-2")], now));
+        let (query_nonce, query_ts) = mail.issue_mailbox_challenge(&recipient, now).unwrap();
+        let query_sig = void_frames::protocol::sign_mailbox_query(
+            &owner, &peer, query_ts, &query_nonce,
+        ).unwrap();
+        let (lease_id, _, ack_nonce, _) = mail.lease_legacy_signed(
+            &recipient, query_ts, &query_nonce, &query_sig, 1 << 20, now,
+        ).unwrap();
+        let persisted = RelayFileV5 {
+            dir: mail.dir.export(),
+            pending: HashMap::new(),
+            legacy: mail.legacy.clone(),
+            leases: mail.leases.clone(),
+        };
+        let mut disk = FORMAT_V5.to_vec();
+        disk.extend(bincode::serialize(&persisted).unwrap());
+        let mut restarted = RelayMailbox::empty(None);
+        restarted.ingest(&disk, now);
+        assert_eq!(restarted.leases.get(&restarted.legacy_slot(&recipient)).unwrap().len(), 1);
+        let ack_ts = now + 1;
+        let ack_sig = void_frames::protocol::sign_mailbox_ack(
+            &owner, &peer, &lease_id, ack_ts, &ack_nonce,
+        ).unwrap();
+        assert!(restarted.ack_legacy(&recipient, &lease_id, ack_ts, &ack_nonce, &ack_sig, ack_ts));
+        assert!(restarted.leases.is_empty());
+        assert!(restarted.legacy.is_empty());
     }
 
     #[test]
