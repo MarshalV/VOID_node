@@ -79,7 +79,10 @@ pub struct SeedEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum SeedRequest {
-    Exchange { offer: Vec<SeedEntry>, want_max: u32 },
+    Exchange {
+        offer: Vec<SeedEntry>,
+        want_max: u32,
+    },
     /// Повторный обмен, когда с одного /16 уже больше лимита TCP.
     Prove {
         nonce: [u8; 32],
@@ -92,10 +95,16 @@ pub enum SeedRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SeedResponse {
-    Peers { peers: Vec<SeedEntry> },
-    Error { message: String },
+    Peers {
+        peers: Vec<SeedEntry>,
+    },
+    Error {
+        message: String,
+    },
     /// Одноразовый nonce. Клиент подписывает его ключом своего PeerId.
-    Sybil { nonce: [u8; 32] },
+    Sybil {
+        nonce: [u8; 32],
+    },
 }
 
 pub const SYBIL_PREFIX: &[u8] = b"VOID_SYBIL_PEER_v1\0";
@@ -119,7 +128,8 @@ pub fn verify_sybil(pk: &[u8; 32], peer_id_bytes: &[u8], nonce: &[u8; 32], sig: 
     let Ok(sig) = Signature::from_slice(sig) else {
         return false;
     };
-    vk.verify(&sybil_message(nonce, peer_id_bytes), &sig).is_ok()
+    vk.verify(&sybil_message(nonce, peer_id_bytes), &sig)
+        .is_ok()
 }
 
 /// msg4. Сервер подписывает оба PeerId и время. Клиент не принимает список без подписи.
@@ -260,8 +270,16 @@ fn build_auth(
     })
 }
 
-fn both_context(e_c: &[u8; 32], e_s: &[u8; 32], server_peer: &[u8], client_peer: &[u8], timestamp: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(PROTOCOL_VERSION.len() + 6 + 64 + server_peer.len() + client_peer.len() + 8);
+fn both_context(
+    e_c: &[u8; 32],
+    e_s: &[u8; 32],
+    server_peer: &[u8],
+    client_peer: &[u8],
+    timestamp: u64,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(
+        PROTOCOL_VERSION.len() + 6 + 64 + server_peer.len() + client_peer.len() + 8,
+    );
     v.extend_from_slice(PROTOCOL_VERSION.as_bytes());
     v.extend_from_slice(b"|both|");
     v.extend_from_slice(e_c);
@@ -327,7 +345,7 @@ pub fn verify_auth(
     }
 
     let now = now_secs();
-    let skew = if now > auth.timestamp { now - auth.timestamp } else { auth.timestamp - now };
+    let skew = now.abs_diff(auth.timestamp);
     if skew > 5 * 60 {
         bail!("clock skew too large: {}s", skew);
     }
@@ -386,7 +404,13 @@ impl Session {
             .checked_add(1)
             .ok_or_else(|| anyhow!("send counter overflow"))?;
         cipher
-            .encrypt(&n, Payload { msg: plaintext, aad: PROTOCOL_VERSION.as_bytes() })
+            .encrypt(
+                &n,
+                Payload {
+                    msg: plaintext,
+                    aad: PROTOCOL_VERSION.as_bytes(),
+                },
+            )
             .map_err(|e| anyhow!("encrypt: {e}"))
     }
 
@@ -399,7 +423,13 @@ impl Session {
             .checked_add(1)
             .ok_or_else(|| anyhow!("recv counter overflow"))?;
         cipher
-            .decrypt(&n, Payload { msg: ct, aad: PROTOCOL_VERSION.as_bytes() })
+            .decrypt(
+                &n,
+                Payload {
+                    msg: ct,
+                    aad: PROTOCOL_VERSION.as_bytes(),
+                },
+            )
             .map_err(|e| anyhow!("decrypt: {e}"))
     }
 }
@@ -440,7 +470,13 @@ where
 
     let cipher1 = ChaCha20Poly1305::new(&k1);
     let ct1 = cipher1
-        .encrypt(&nonce(0), Payload { msg: &auth_s_bytes, aad: PROTOCOL_VERSION.as_bytes() })
+        .encrypt(
+            &nonce(0),
+            Payload {
+                msg: &auth_s_bytes,
+                aad: PROTOCOL_VERSION.as_bytes(),
+            },
+        )
         .map_err(|e| anyhow!("encrypt auth_s: {e}"))?;
     let mut m2 = Vec::with_capacity(32 + ct1.len());
     m2.extend_from_slice(&e_s_pub_bytes);
@@ -450,8 +486,16 @@ where
     let m3 = read_frame(stream).await.context("msg3 read")?;
     let cipher2 = ChaCha20Poly1305::new(&k2);
     let m3_pt = cipher2
-        .decrypt(&nonce(0), Payload { msg: &m3, aad: PROTOCOL_VERSION.as_bytes() })
-        .map_err(|e| anyhow!("decrypt msg3 (peer is not a VOID seed or has a different key): {e}"))?;
+        .decrypt(
+            &nonce(0),
+            Payload {
+                msg: &m3,
+                aad: PROTOCOL_VERSION.as_bytes(),
+            },
+        )
+        .map_err(|e| {
+            anyhow!("decrypt msg3 (peer is not a VOID seed or has a different key): {e}")
+        })?;
     let cmsg: ClientMsg = bincode::deserialize(&m3_pt).context("msg3 deserialize")?;
     let own_peer = kp.public().to_peer_id().to_bytes();
     let peer_id_b58 = verify_auth(
@@ -497,7 +541,9 @@ where
     let e_c_secret = EphemeralSecret::random_from_rng(OsRng);
     let e_c_pub = XPublicKey::from(&e_c_secret);
     let e_c_pub_bytes: [u8; 32] = e_c_pub.to_bytes();
-    write_frame(stream, &e_c_pub_bytes).await.context("msg1 write")?;
+    write_frame(stream, &e_c_pub_bytes)
+        .await
+        .context("msg1 write")?;
 
     let m2 = read_frame(stream).await.context("msg2 read")?;
     if m2.len() < 32 + 16 {
@@ -512,7 +558,13 @@ where
 
     let cipher1 = ChaCha20Poly1305::new(&k1);
     let auth_s_bytes = cipher1
-        .decrypt(&nonce(0), Payload { msg: ct1, aad: PROTOCOL_VERSION.as_bytes() })
+        .decrypt(
+            &nonce(0),
+            Payload {
+                msg: ct1,
+                aad: PROTOCOL_VERSION.as_bytes(),
+            },
+        )
         .map_err(|e| anyhow!("decrypt msg2 (peer is not a VOID seed): {e}"))?;
     let auth_s: AuthPayload = bincode::deserialize(&auth_s_bytes).context("msg2 deserialize")?;
     let peer_id_b58 = verify_auth(&auth_s, "s", &e_c_pub_bytes, &e_s_pub_bytes, None)
@@ -525,17 +577,32 @@ where
         &e_s_pub_bytes,
         Some(auth_s.peer_id_bytes.as_slice()),
     )?;
-    let cm_bytes = bincode::serialize(&ClientMsg { auth: auth_c, request })?;
+    let cm_bytes = bincode::serialize(&ClientMsg {
+        auth: auth_c,
+        request,
+    })?;
 
     let cipher2 = ChaCha20Poly1305::new(&k2);
     let ct2 = cipher2
-        .encrypt(&nonce(0), Payload { msg: &cm_bytes, aad: PROTOCOL_VERSION.as_bytes() })
+        .encrypt(
+            &nonce(0),
+            Payload {
+                msg: &cm_bytes,
+                aad: PROTOCOL_VERSION.as_bytes(),
+            },
+        )
         .map_err(|e| anyhow!("encrypt msg3: {e}"))?;
     write_frame(stream, &ct2).await.context("msg3 write")?;
 
     let m4 = read_frame(stream).await.context("msg4 read")?;
     let m4_pt = cipher2
-        .decrypt(&nonce(1), Payload { msg: &m4, aad: PROTOCOL_VERSION.as_bytes() })
+        .decrypt(
+            &nonce(1),
+            Payload {
+                msg: &m4,
+                aad: PROTOCOL_VERSION.as_bytes(),
+            },
+        )
         .map_err(|e| anyhow!("decrypt msg4: {e}"))?;
     let response = open_seed_delivery(
         &m4_pt,
@@ -547,5 +614,9 @@ where
     )
     .context("seed confirm")?;
 
-    Ok(ClientExchangeResult { peer_auth: auth_s, response, peer_id_b58 })
+    Ok(ClientExchangeResult {
+        peer_auth: auth_s,
+        response,
+        peer_id_b58,
+    })
 }

@@ -163,16 +163,16 @@ impl Lang {
 
     pub fn connecting(self, host: &str, port: u16) -> String {
         match self {
-            Self::En => format!(
-                ">>> Connecting to {host}:{port} (encrypted VOID-SEED/v1 handshake)..."
-            ),
+            Self::En => {
+                format!(">>> Connecting to {host}:{port} (encrypted VOID-SEED/v1 handshake)...")
+            }
             Self::Ru => format!(
                 ">>> Подключаемся к {host}:{port} (зашифрованный handshake VOID-SEED/v1)..."
             ),
             Self::Zh => format!(">>> 正在连接 {host}:{port}（加密握手 VOID-SEED/v1）..."),
-            Self::Fr => format!(
-                ">>> Connexion à {host}:{port} (handshake chiffré VOID-SEED/v1)..."
-            ),
+            Self::Fr => {
+                format!(">>> Connexion à {host}:{port} (handshake chiffré VOID-SEED/v1)...")
+            }
         }
     }
 
@@ -246,12 +246,8 @@ impl Lang {
 
     pub fn join_err_fallback(self) -> &'static str {
         match self {
-            Self::En => {
-                ">>> Starting as an isolated network — others can still connect to us."
-            }
-            Self::Ru => {
-                ">>> Стартую как изолированная сеть -- другие смогут подключиться к нам."
-            }
+            Self::En => ">>> Starting as an isolated network — others can still connect to us.",
+            Self::Ru => ">>> Стартую как изолированная сеть -- другие смогут подключиться к нам.",
             Self::Zh => ">>> 将以孤立网络启动 — 其他节点仍可连接本机。",
             Self::Fr => {
                 ">>> Démarrage en réseau isolé — les autres pourront toujours se connecter."

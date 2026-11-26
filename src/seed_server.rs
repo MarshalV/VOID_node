@@ -14,9 +14,7 @@ use tokio::io::BufStream;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 
-use crate::seed_protocol::{
-    self, write_frame, SeedEntry, SeedRequest, SeedResponse, MAX_FRAME,
-};
+use crate::seed_protocol::{self, write_frame, SeedEntry, SeedRequest, SeedResponse, MAX_FRAME};
 use crate::state::AppState;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -28,6 +26,11 @@ pub async fn run(state: Arc<AppState>, bind: String) -> Result<()> {
         .with_context(|| format!("bind seed server {bind}"))?;
     tracing::info!(%bind, "seed server listening");
 
+    let slots = Arc::new(tokio::sync::Semaphore::new(64));
+    let per_ip = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        std::net::IpAddr,
+        usize,
+    >::new()));
     loop {
         let (sock, remote) = match listener.accept().await {
             Ok(v) => v,
@@ -36,27 +39,51 @@ pub async fn run(state: Arc<AppState>, bind: String) -> Result<()> {
                 continue;
             }
         };
+        let Ok(permit) = slots.clone().try_acquire_owned() else {
+            continue;
+        };
+        {
+            let mut counts = per_ip.lock().unwrap_or_else(|e| e.into_inner());
+            let count = counts.entry(remote.ip()).or_default();
+            if *count >= 4 {
+                continue;
+            }
+            *count += 1;
+        }
+        let counts = per_ip.clone();
         let _ = sock.set_nodelay(true);
         let state_cloned = state.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(state_cloned, sock, remote.ip().to_string()).await {
+            let _permit = permit;
+            if let Err(e) = timeout(
+                Duration::from_secs(15),
+                handle_conn(state_cloned, sock, remote.ip().to_string()),
+            )
+            .await
+            {
                 tracing::debug!(?e, "seed conn ended");
+            }
+            let mut counts = counts.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = counts.get_mut(&remote.ip()) {
+                *count -= 1;
+                if *count == 0 {
+                    counts.remove(&remote.ip());
+                }
             }
         });
     }
 }
 
-async fn handle_conn(
-    state: Arc<AppState>,
-    sock: TcpStream,
-    remote_ip: String,
-) -> Result<()> {
+async fn handle_conn(state: Arc<AppState>, sock: TcpStream, remote_ip: String) -> Result<()> {
     let _ = MAX_FRAME; // keep the symbol used
     let mut stream = BufStream::new(sock);
 
-    let hs = timeout(HANDSHAKE_TIMEOUT, seed_protocol::server_handshake(&mut stream, &state.keypair))
-        .await
-        .context("handshake timeout")??;
+    let hs = timeout(
+        HANDSHAKE_TIMEOUT,
+        seed_protocol::server_handshake(&mut stream, &state.keypair),
+    )
+    .await
+    .context("handshake timeout")??;
 
     let peer_id_b58 = hs.session.peer_id_b58.clone();
     let mut session = hs.session;
@@ -148,12 +175,16 @@ async fn merge_seed(
     peer_id_b58: &str,
     remote_ip: &str,
 ) -> SeedResponse {
-    let want = want_max.min(ANSWER_MAX).max(1) as usize;
-    let self_announced = offer
-        .iter()
-        .find(|e| e.peer_id_b58 == peer_id_b58)
-        .cloned();
-    let (added, _total) = state.store.merge(offer, &state.my_peer_id_b58).await;
+    if offer.len() > 256 {
+        return SeedResponse::Error {
+            message: "too many seed entries".into(),
+        };
+    }
+    let want = want_max.clamp(1, ANSWER_MAX) as usize;
+    let self_announced = offer.iter().find(|e| e.peer_id_b58 == peer_id_b58).cloned();
+    // A third party cannot authorize another node's endpoint. Only the
+    // authenticated self advertisement is eligible, bound to the observed IP.
+    let (added, _total) = state.store.merge(offer.clone(), &state.my_peer_id_b58).await;
     if added > 0 {
         tracing::debug!(added, "new seeds learned");
     }
@@ -193,3 +224,4 @@ fn now_secs() -> u64 {
 // Unused but keeps compiler aware that identity is a dep here.
 #[allow(dead_code)]
 fn _types(_: &identity::Keypair) {}
+

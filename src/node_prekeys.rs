@@ -59,6 +59,8 @@ pub(crate) struct PrekeyDir {
     path: PathBuf,
     key: [u8; 32],
     records: HashMap<String, Record>,
+    requests: HashMap<String, (std::time::Instant, u32)>,
+    global_requests: (std::time::Instant, u32),
 }
 
 impl PrekeyDir {
@@ -71,6 +73,8 @@ impl PrekeyDir {
             path: path.to_path_buf(),
             key: seal_key,
             records: HashMap::new(),
+            requests: HashMap::new(),
+            global_requests: (std::time::Instant::now(), 0),
         };
         if path.exists() {
             if let Ok(bytes) = std::fs::read(path) {
@@ -140,6 +144,32 @@ impl PrekeyDir {
             }
         }
         self.save().is_ok()
+    }
+
+    pub(crate) fn take_for(
+        &mut self,
+        requester: &str,
+        peer: &str,
+        now: u64,
+    ) -> Option<PrekeyOfferOut> {
+        let tick = std::time::Instant::now();
+        self.requests
+            .retain(|_, (start, _)| tick.duration_since(*start).as_secs() < 60);
+        if tick.duration_since(self.global_requests.0).as_secs() >= 60 {
+            self.global_requests = (tick, 0);
+        }
+        if self.global_requests.1 >= 120
+            || (!self.requests.contains_key(requester) && self.requests.len() >= 4096)
+        {
+            return None;
+        }
+        let bucket = self.requests.entry(requester.into()).or_insert((tick, 0));
+        if bucket.1 >= 4 {
+            return None;
+        }
+        bucket.1 += 1;
+        self.global_requests.1 += 1;
+        self.take(peer, now)
     }
 
     /// Remove one one-time key and persist that removal before it is returned.
@@ -310,9 +340,14 @@ mod tests {
         let now = offline_mail::prekey_unix_now();
         let owner = kp.public().to_peer_id();
         let kem = vec![6u8; KEM_EK_LEN];
-        let published =
-            void_envelope::offline_mail::encode_signed_prekey_v3(&kp, &owner, &[4u8; 32], now + 3600, &kem)
-                .unwrap();
+        let published = void_envelope::offline_mail::encode_signed_prekey_v3(
+            &kp,
+            &owner,
+            &[4u8; 32],
+            now + 3600,
+            &kem,
+        )
+        .unwrap();
         assert!(store.put(
             &peer,
             published.pk,

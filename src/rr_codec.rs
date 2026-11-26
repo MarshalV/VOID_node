@@ -81,8 +81,8 @@ where
 {
     let mut buf = Vec::new();
     io.take(max).read_to_end(&mut buf).await?;
-    let (packet, encoding) = wire::decode_v1_packet(&buf)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let (packet, encoding) =
+        wire::decode_v1_packet(&buf).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
     Ok(WireMsg {
         packet,
         cbor: encoding == WireEncoding::Cbor,

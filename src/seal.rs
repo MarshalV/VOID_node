@@ -88,3 +88,52 @@ pub fn mailbox_slot(key: &[u8; 32], label: &str) -> String {
     h.update(label.as_bytes());
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
+/// Create a private file before any secret bytes are written. Never follow a link.
+pub fn write_private_new(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(windows)]
+    {
+        let user = std::env::var("USERNAME").map_err(std::io::Error::other)?;
+        let status = std::process::Command::new("icacls")
+            .arg(path)
+            .args(["/inheritance:r", "/grant:r", &format!("{user}:F")])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()?;
+        if !status.success() {
+            return Err(std::io::Error::other("cannot restrict secret ACL"));
+        }
+    }
+    file.write_all(bytes)?;
+    file.sync_all()
+}
+
+pub fn check_private(path: &std::path::Path) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_file() || meta.file_type().is_symlink() {
+        return Err(std::io::Error::other("secret must be a regular file"));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if meta.permissions().mode() & 0o077 != 0 {
+            return Err(std::io::Error::other("secret permissions must be 0600"));
+        }
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err(std::io::Error::other("secret reparse point refused"));
+        }
+    }
+    Ok(())
+}

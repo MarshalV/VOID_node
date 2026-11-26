@@ -96,9 +96,17 @@ pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<Cont
     };
 
     let received = peers.len();
+    if received > 256 {
+        return Err(anyhow!("too many seed entries"));
+    }
+    // Gossip entries are unverified hints, never dial targets. Keep only the
+    // identity we just authenticated, at the IP of this actual connection.
+    let remote_ip = stream.get_ref().peer_addr()?.ip().to_string();
+    peers.retain(|e| e.peer_id_b58 == res.peer_id_b58 && e.host == remote_ip);
+    let host = remote_ip.as_str();
 
     // Remember the seed we just talked to (use the host the operator typed).
-    let libp2p_port = state.reach.read().await.libp2p_port;
+    let libp2p_port = peers.first().map(|e| e.libp2p_port).unwrap_or(4001);
     state
         .store
         .touch(&res.peer_id_b58, host, port, libp2p_port)
@@ -114,7 +122,10 @@ pub async fn contact(state: Arc<AppState>, host: &str, port: u16) -> Result<Cont
         last_seen: crate::state::now_secs(),
     });
 
-    let (added, _total) = state.store.merge(peers.clone(), &state.my_peer_id_b58).await;
+    let (added, _total) = state
+        .store
+        .merge(peers.clone(), &state.my_peer_id_b58)
+        .await;
 
     Ok(ContactReport {
         peer_id_b58: res.peer_id_b58,

@@ -22,14 +22,14 @@
 //!      VOID-SEED/v1 listener (TCP on SEED_PORT) so other nodes can
 //!      bootstrap from us in turn.
 
-mod rr_codec;
 mod i18n;
 mod kad_store;
 mod node_prekeys;
 mod onion;
-mod relay_mailbox;
-mod seal;
 mod port_pub;
+mod relay_mailbox;
+mod rr_codec;
+mod seal;
 mod seed_client;
 mod seed_protocol;
 mod seed_server;
@@ -38,10 +38,10 @@ mod storage;
 mod sybil;
 
 use futures::StreamExt;
-use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter, fmt};
 use libp2p::{
-    autonat, identify, identity, kad, noise, ping, relay,
+    autonat, identify, identity, kad,
     multiaddr::Protocol,
+    noise, ping, relay,
     swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
     tcp, yamux, Multiaddr, PeerId, StreamProtocol,
 };
@@ -55,18 +55,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::signal;
 use tracing::info;
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
-use void_frames::protocol::{
-    decode_v2_mailbox, wrap_mailbox_reply, OnionHopHint, V1Packet, HELLO_CAP_CBOR,
-};
-use void_envelope::offline_mail::OfflineEnvelope;
-use void_envelope::queue_mail;
-use crate::node_prekeys::PrekeyDir;
 use crate::i18n::Lang;
+use crate::node_prekeys::PrekeyDir;
 use crate::relay_mailbox::RelayMailbox;
 use crate::seed_protocol::SeedEntry;
 use crate::state::AppState;
 use crate::storage::NodesStore;
+use void_envelope::offline_mail::OfflineEnvelope;
+use void_envelope::queue_mail;
+use void_frames::protocol::{
+    decode_v2_mailbox, wrap_mailbox_reply, OnionHopHint, V1Packet, HELLO_CAP_CBOR,
+};
 
 const IDENTITY_FILE: &str = "bootstrap_peer.key";
 const NODES_FILE: &str = "known_nodes.json";
@@ -77,13 +78,14 @@ const CHAT_PROTOCOL: &str = "/void/chat/1.0.0";
 
 fn load_or_create_keypair(path: &Path) -> Result<identity::Keypair, Box<dyn Error + Send + Sync>> {
     if path.exists() {
+        crate::seal::check_private(path)?;
         let buf = std::fs::read(path)?;
         let kp = identity::Keypair::from_protobuf_encoding(&buf)
             .map_err(|e| format!("bootstrap_peer.key: {e}"))?;
         Ok(kp)
     } else {
         let kp = identity::Keypair::generate_ed25519();
-        std::fs::write(path, kp.to_protobuf_encoding()?)?;
+        crate::seal::write_private_new(path, &kp.to_protobuf_encoding()?)?;
         tracing::info!(
             "new key generated; back up {} -- the multiaddr depends on it",
             path.display()
@@ -172,7 +174,7 @@ async fn prompt_language() -> Lang {
                 println!("{}", lang.selected());
                 return lang;
             }
-        println!("{}", Lang::En.invalid_language());
+            println!("{}", Lang::En.invalid_language());
             continue;
         }
         if let Some(lang) = Lang::parse(&raw) {
@@ -366,7 +368,9 @@ fn advertised_self_addrs(
         }
     }
     for addr in listen {
-        if addr_is_unspecified(addr) || addr_is_quic(addr) || addr.to_string().contains("p2p-circuit")
+        if addr_is_unspecified(addr)
+            || addr_is_quic(addr)
+            || addr.to_string().contains("p2p-circuit")
         {
             continue;
         }
@@ -448,11 +452,7 @@ fn onion_directory_packet(
     }
 }
 
-fn enqueue_onion(
-    pending: &mut HashMap<PeerId, Vec<V1Packet>>,
-    next: PeerId,
-    packet: V1Packet,
-) {
+fn enqueue_onion(pending: &mut HashMap<PeerId, Vec<V1Packet>>, next: PeerId, packet: V1Packet) {
     let q = pending.entry(next).or_default();
     if q.len() >= MAX_PENDING_ONION {
         q.remove(0);
@@ -622,7 +622,10 @@ fn box_response(
                 Some(BoxEffect::bare(V1Packet::Ack))
             } else {
                 Some(BoxEffect::bare(V1Packet::OfflineMailboxDeliver {
-                    envelopes: Vec::new(), lease_id: None, ack_nonce: None, ack_ts: None,
+                    envelopes: Vec::new(),
+                    lease_id: None,
+                    ack_nonce: None,
+                    ack_ts: None,
                 }))
             }
         }
@@ -630,7 +633,11 @@ fn box_response(
             let Some((nonce, ts)) = mail.issue_mailbox_challenge(&recipient, now) else {
                 return Some(BoxEffect::bare(V1Packet::Ack));
             };
-            Some(BoxEffect::bare(V1Packet::MailboxChallenge { nonce, ts, lease }))
+            Some(BoxEffect::bare(V1Packet::MailboxChallenge {
+                nonce,
+                ts,
+                lease,
+            }))
         }
         V1Packet::OfflineMailboxQuery {
             recipient,
@@ -649,7 +656,10 @@ fn box_response(
                     mail.restore_legacy(&recipient, envelopes, now);
                     tracing::warn!("mailbox lease persistence failed: {error}");
                     return Some(BoxEffect::bare(V1Packet::OfflineMailboxDeliver {
-                        envelopes: Vec::new(), lease_id: None, ack_nonce: None, ack_ts: None,
+                        envelopes: Vec::new(),
+                        lease_id: None,
+                        ack_nonce: None,
+                        ack_ts: None,
                     }));
                 }
                 Some(BoxEffect {
@@ -671,7 +681,10 @@ fn box_response(
                 let _ = mail.save();
                 Some(BoxEffect {
                     response: V1Packet::OfflineMailboxDeliver {
-                        envelopes: envs.clone(), lease_id: None, ack_nonce: None, ack_ts: None,
+                        envelopes: envs.clone(),
+                        lease_id: None,
+                        ack_nonce: None,
+                        ack_ts: None,
                     },
                     restore_queue: None,
                     restore_legacy: Some((recipient, envs)),
@@ -679,7 +692,13 @@ fn box_response(
                 })
             }
         }
-        V1Packet::OfflineMailboxAck { recipient, lease_id, ts, nonce, sig } => {
+        V1Packet::OfflineMailboxAck {
+            recipient,
+            lease_id,
+            ts,
+            nonce,
+            sig,
+        } => {
             if mail.ack_legacy(&recipient, &lease_id, ts, &nonce, &sig, now) {
                 let _ = mail.save();
             }
@@ -851,7 +870,7 @@ fn onion_try_forward(
         }
         addrs.extend(circuit_dial_addrs(&relay.addrs, next));
     }
-    addrs.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    addrs.sort_by_key(|a| a.to_string());
     addrs.dedup();
     if !addrs.is_empty() {
         dial_peer_best_effort(swarm, next, addrs);
@@ -944,17 +963,7 @@ fn dispatch_mail(
         } => {
             let owner_ok = peer_id.parse::<PeerId>().ok() == Some(peer);
             let now = void_envelope::offline_mail::prekey_unix_now();
-            if owner_ok
-                && prekeys.put(
-                    &peer_id,
-                    public_key,
-                    not_after,
-                    sig,
-                    &kem_ek,
-                    opks,
-                    now,
-                )
-            {
+            if owner_ok && prekeys.put(&peer_id, public_key, not_after, sig, &kem_ek, opks, now) {
                 tracing::debug!("relay: prekey stored");
             } else {
                 tracing::debug!("relay: prekey put rejected");
@@ -963,7 +972,7 @@ fn dispatch_mail(
         }
         V1Packet::PrekeyGet { peer_id } => {
             let now = void_envelope::offline_mail::prekey_unix_now();
-            let response = if let Some(parts) = prekeys.take(&peer_id, now) {
+            let response = if let Some(parts) = prekeys.take_for(&peer.to_string(), &peer_id, now) {
                 tracing::debug!("relay: prekey hit");
                 V1Packet::PrekeyOffer {
                     peer_id,
@@ -980,19 +989,9 @@ fn dispatch_mail(
             send_rr_response(swarm, channel, cbor, response);
         }
         _ => {
-            // Queue fallback remains available. PeerId mailbox data is only
-            // released through the signed, leased OfflineMailboxQuery path.
-            let now = crate::relay_mailbox::now_secs();
-            let recipient = peer.to_string();
-            let blobs = mail.take_all_queues(crate::relay_mailbox::DELIVER_BATCH_PLAIN_BYTES, now);
-            if !blobs.is_empty() {
-                let _ = mail.save();
-                tracing::debug!(blobs = blobs.len(), %recipient, "relay: fallback deliver queues on any client request");
-                send_rr_response(swarm, channel, cbor, V1Packet::QueueDeliver { blobs });
-            } else {
-                drop(channel);
-                tracing::debug!("relay: unsupported frame, request closed");
-            }
+            // Unsupported frames must never read or mutate another owner's queue.
+            drop(channel);
+            tracing::debug!("relay: unsupported frame, request closed");
         }
     }
 }
@@ -1037,9 +1036,7 @@ async fn dispatch_onion(
                                 if next == local_peer_id {
                                     match inner {
                                         V1Packet::OnionDrop { .. } => {
-                                            tracing::debug!(
-                                                "onion: OnionDrop on exit (ignored)"
-                                            );
+                                            tracing::debug!("onion: OnionDrop on exit (ignored)");
                                         }
                                         other => {
                                             if let Some(effect) =
@@ -1215,7 +1212,9 @@ async fn dispatch_onion(
                         .filter_map(|s| s.parse::<Multiaddr>().ok())
                         .filter(|ma| {
                             !addr_is_quic(ma)
-                                && ma.iter().any(|p| matches!(p, Protocol::P2p(id) if id == pid))
+                                && ma
+                                    .iter()
+                                    .any(|p| matches!(p, Protocol::P2p(id) if id == pid))
                         })
                         .collect()
                 } else {
@@ -1294,8 +1293,7 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
 
     let keypair = load_or_create_keypair(Path::new(IDENTITY_FILE))?;
     let local_peer_id = keypair.public().to_peer_id();
-    let mut onion_mat =
-        crate::onion::OnionMaterial::load(Path::new(crate::onion::ONION_KEY_FILE))?;
+    let mut onion_mat = crate::onion::OnionMaterial::load(Path::new(crate::onion::ONION_KEY_FILE))?;
     let mut onion_pk = onion_mat.pk();
     let mut local_onion_sig =
         crate::onion::sign_onion_pk(&keypair, local_peer_id, &onion_pk).unwrap_or_default();
@@ -1326,8 +1324,15 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(4010);
-    let seed_bind: String =
-        std::env::var("SEED_BIND").unwrap_or_else(|_| format!("0.0.0.0:{seed_port}"));
+    let public_mode = std::env::var("VOID_PUBLIC_NODE").as_deref() == Ok("1");
+    let listen_ip: std::net::IpAddr = std::env::var("LISTEN_IP")
+        .unwrap_or_else(|_| if public_mode { "0.0.0.0" } else { "127.0.0.1" }.into())
+        .parse()?;
+    let seed_bind = std::env::var("SEED_BIND")
+        .unwrap_or_else(|_| std::net::SocketAddr::new(listen_ip, seed_port).to_string());
+    if listen_ip.is_unspecified() {
+        tracing::warn!("public wildcard listener enabled; apply host firewall quotas");
+    }
 
     let reach = port_pub::discover(libp2p_port, seed_port).await;
     let store = NodesStore::load(NODES_FILE, &keypair).await?;
@@ -1400,18 +1405,16 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
             let mut kad = kad::Behaviour::with_config(pid, store, cfg);
             kad.set_mode(Some(kad::Mode::Server));
 
-            // Private VOID relay: default libp2p limits (16 circuits, 128 KiB,
-            // 2 min, 1 reservation/circuit per IP per minute) drop same-NAT
-            // clients and kill chat. Both peers often share one public IP.
-            let mut relay_cfg = relay::Config::default();
-            relay_cfg.max_reservations = 1024;
-            relay_cfg.max_reservations_per_peer = 32;
-            relay_cfg.max_circuits = 256;
-            relay_cfg.max_circuits_per_peer = 32;
-            relay_cfg.max_circuit_duration = Duration::from_secs(60 * 60);
-            relay_cfg.max_circuit_bytes = 64 * 1024 * 1024;
-            relay_cfg.reservation_rate_limiters.clear();
-            relay_cfg.circuit_src_rate_limiters.clear();
+            // Keep library per-IP and per-peer rate limiters, with finite chat budgets.
+            let relay_cfg = relay::Config {
+                max_reservations: 128,
+                max_reservations_per_peer: 4,
+                max_circuits: 64,
+                max_circuits_per_peer: 4,
+                max_circuit_duration: Duration::from_secs(15 * 60),
+                max_circuit_bytes: 16 * 1024 * 1024,
+                ..Default::default()
+            };
             let relay = relay::Behaviour::new(pid, relay_cfg);
             let autonat = autonat::Behaviour::new(pid, autonat::Config::default());
 
@@ -1453,9 +1456,17 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
         .with_swarm_config(|c| c.with_idle_connection_timeout(Duration::from_secs(1200)))
         .build();
 
-    let tcp_addr: Multiaddr = format!("/ip4/0.0.0.0/tcp/{libp2p_port}").parse()?;
+    let tcp_addr: Multiaddr = format!(
+        "/{}/{listen_ip}/tcp/{libp2p_port}",
+        if listen_ip.is_ipv4() { "ip4" } else { "ip6" }
+    )
+    .parse()?;
     swarm.listen_on(tcp_addr)?;
-    let quic_addr: Multiaddr = format!("/ip4/0.0.0.0/udp/{libp2p_port}/quic-v1").parse()?;
+    let quic_addr: Multiaddr = format!(
+        "/{}/{listen_ip}/udp/{libp2p_port}/quic-v1",
+        if listen_ip.is_ipv4() { "ip4" } else { "ip6" }
+    )
+    .parse()?;
     if let Err(e) = swarm.listen_on(quic_addr) {
         tracing::warn!("QUIC failed on {}: {:?}", libp2p_port, e);
     }
@@ -1548,7 +1559,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
                 host_part, r.libp2p_port, local_peer_id
             );
         } else {
-            println!("  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{}", libp2p_port, local_peer_id);
+            println!(
+                "  /ip4/<PUBLIC_IP>/tcp/{}/p2p/{}",
+                libp2p_port, local_peer_id
+            );
             println!(
                 "  /ip4/<PUBLIC_IP>/udp/{}/quic-v1/p2p/{}",
                 libp2p_port, local_peer_id
@@ -1592,7 +1606,10 @@ async fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
     let mut listen_addrs: Vec<Multiaddr> = Vec::new();
     let mut onion_gossiped: HashSet<PeerId> = HashSet::new();
     let mut sybil_conns: HashMap<libp2p::swarm::ConnectionId, u64> = HashMap::new();
-    tracing::info!("offline relay mailbox: {} slots on disk", relay_mail.slot_count());
+    tracing::info!(
+        "offline relay mailbox: {} slots on disk",
+        relay_mail.slot_count()
+    );
 
     loop {
         tokio::select! {

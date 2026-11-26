@@ -266,3 +266,25 @@ Circuit Relay v2 is unchanged. Offline mail is the queue above; a PeerId box is 
 ## License
 
 MIT — see [LICENSE](LICENSE).
+
+
+## Security defaults (2026-11)
+
+The node runs in local mode by default: listeners bind to `127.0.0.1`. Set
+`VOID_PUBLIC_NODE=1` and configure firewall policy before exposing a relay; use
+`LISTEN_IP`/`SEED_BIND` for an explicit interface. UPnP and CloudPub publication
+are opt-in. Relay reservation and circuit rate limiters remain enabled, with
+finite circuit, duration, byte, per-peer and per-IP budgets.
+
+Seed exchange has bounded concurrency (64 handshakes globally, 4 per source
+IP), a 15-second connection budget, and a 256-entry offer cap. Seed gossip is
+only a discovery hint: endpoint data is accepted for the authenticated peer
+only when it matches the observed seed connection address. The node refuses
+private, loopback, link-local, multicast, metadata and unspecified addresses.
+
+Queue data is never returned for an unsupported request. Delivery requires the
+existing challenge plus owner signature and lease/Ack flow. `PrekeyGet` is
+rate-limited per peer and globally; exhaustion returns an empty response.
+Bootstrap HTTP discovery requires HTTPS, an exact `VOID_BOOTSTRAP_TRUSTED_HOSTS`
+allowlist, and a detached Ed25519 signature (`VOID_BOOTSTRAP_SIGNING_PUB_HEX`
+and `VOID_BOOTSTRAP_URL_SIG_HEX`). Redirects are disabled.

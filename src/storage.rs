@@ -28,6 +28,7 @@ pub struct NodesStore {
     inner: Arc<RwLock<HashMap<String, SeedEntry>>>,
     path: PathBuf,
     seal_key: [u8; 32],
+    persist_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl NodesStore {
@@ -37,9 +38,9 @@ impl NodesStore {
         let mut map: HashMap<String, SeedEntry> = HashMap::new();
         let mut migrated = false;
         if path.exists() {
-            let bytes = tokio::fs::read(&path).await.with_context(|| {
-                format!("failed to read nodes file {}", path.display())
-            })?;
+            let bytes = tokio::fs::read(&path)
+                .await
+                .with_context(|| format!("failed to read nodes file {}", path.display()))?;
             if !bytes.is_empty() {
                 let plain = if seal::is_sealed(&bytes) {
                     match seal::unseal(&seal_key, &bytes) {
@@ -58,7 +59,7 @@ impl NodesStore {
                 if !plain.is_empty() {
                     match serde_json::from_slice::<NodesFile>(&plain) {
                         Ok(file) => {
-                            for e in file.nodes {
+                            for e in file.nodes.into_iter().take(4096).filter(valid_entry) {
                                 map.insert(e.peer_id_b58.clone(), e);
                             }
                         }
@@ -73,6 +74,7 @@ impl NodesStore {
             inner: Arc::new(RwLock::new(map)),
             path,
             seal_key,
+            persist_lock: Arc::new(tokio::sync::Mutex::new(())),
         };
         if migrated {
             let _ = store.persist().await;
@@ -97,7 +99,11 @@ impl NodesStore {
         let mut added = 0usize;
         {
             let mut g = self.inner.write().await;
-            for e in incoming {
+            for mut e in incoming.into_iter().take(256) {
+                if !valid_entry(&e) {
+                    continue;
+                }
+                e.last_seen = now_secs();
                 if e.peer_id_b58.is_empty() || e.peer_id_b58 == exclude_self {
                     continue;
                 }
@@ -106,21 +112,18 @@ impl NodesStore {
                 }
                 match g.get_mut(&e.peer_id_b58) {
                     Some(existing) => {
-                        // Keep the most recent last_seen, prefer newer host/ports.
-                        if e.last_seen > existing.last_seen {
+                        // Gossip cannot replace an already known endpoint.
+                        if existing.host == e.host
+                            && existing.seed_port == e.seed_port
+                            && existing.libp2p_port == e.libp2p_port
+                        {
                             existing.last_seen = e.last_seen;
-                        }
-                        if !e.host.is_empty() {
-                            existing.host = e.host;
-                        }
-                        if e.seed_port != 0 {
-                            existing.seed_port = e.seed_port;
-                        }
-                        if e.libp2p_port != 0 {
-                            existing.libp2p_port = e.libp2p_port;
                         }
                     }
                     None => {
+                        if g.len() >= 4096 {
+                            continue;
+                        }
                         g.insert(e.peer_id_b58.clone(), e);
                         added += 1;
                     }
@@ -133,9 +136,22 @@ impl NodesStore {
     }
 
     pub async fn touch(&self, peer_id_b58: &str, host: &str, seed_port: u16, libp2p_port: u16) {
+        let candidate = SeedEntry {
+            host: host.into(),
+            seed_port,
+            libp2p_port,
+            peer_id_b58: peer_id_b58.into(),
+            last_seen: 0,
+        };
+        if !valid_entry(&candidate) {
+            return;
+        }
         let now = now_secs();
         {
             let mut g = self.inner.write().await;
+            if !g.contains_key(peer_id_b58) && g.len() >= 4096 {
+                return;
+            }
             let e = g
                 .entry(peer_id_b58.to_string())
                 .or_insert_with(|| SeedEntry {
@@ -189,7 +205,10 @@ impl NodesStore {
     }
 
     pub async fn persist(&self) -> Result<()> {
-        let file = NodesFile { nodes: self.all().await };
+        let _guard = self.persist_lock.lock().await;
+        let file = NodesFile {
+            nodes: self.all().await,
+        };
         let plain = serde_json::to_vec(&file)?;
         let sealed = seal::seal(&self.seal_key, &plain)?;
         let tmp = self.path.with_extension("bin.tmp");
@@ -205,4 +224,37 @@ fn now_secs() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Only literal, globally routable endpoints enter the public seed store.
+fn valid_entry(e: &SeedEntry) -> bool {
+    if e.host.len() > 253
+        || e.peer_id_b58.len() > 128
+        || e.seed_port == 0
+        || e.libp2p_port == 0
+        || e.peer_id_b58.parse::<libp2p::PeerId>().is_err()
+    {
+        return false;
+    }
+    let Ok(ip) = e.host.parse::<std::net::IpAddr>() else {
+        return false;
+    };
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let o = ip.octets();
+            !ip.is_private()
+                && !ip.is_loopback()
+                && !ip.is_link_local()
+                && !ip.is_multicast()
+                && !ip.is_unspecified()
+                && !ip.is_broadcast()
+                && o[0] != 0
+                && o[0] < 224
+                && !(o[0] == 100 && (64..=127).contains(&o[1]))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let o = ip.octets();
+            o[0] & 0xe0 == 0x20 && !ip.is_loopback() && !ip.is_multicast()
+        }
+    }
 }

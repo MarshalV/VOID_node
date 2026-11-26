@@ -45,7 +45,7 @@ pub fn hex_bytes(bytes: &[u8]) -> String {
 
 pub fn parse_hex_bytes(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
-    if s.len() < 2 || s.len() % 2 != 0 || s.len() > 256 {
+    if s.len() < 2 || !s.len().is_multiple_of(2) || s.len() > 256 {
         return None;
     }
     if !s.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -70,7 +70,13 @@ pub fn agent_version_with_pk(base: &str, pk: &[u8; 32], peer: PeerId, kp: &Keypa
     }
 }
 
-pub fn desc_message(peer: PeerId, pk: &[u8; 32], epoch: u64, not_after: u64, operator: &str) -> Vec<u8> {
+pub fn desc_message(
+    peer: PeerId,
+    pk: &[u8; 32],
+    epoch: u64,
+    not_after: u64,
+    operator: &str,
+) -> Vec<u8> {
     let mut v = b"VOID_ONION_DESC_V2\0".to_vec();
     let id = peer.to_bytes();
     let n = id.len().min(u16::MAX as usize);
@@ -255,6 +261,7 @@ impl OnionMaterial {
     pub fn load(path: &Path) -> std::io::Result<Self> {
         let operator = operator_label();
         let mut mat = if path.exists() {
+            crate::seal::check_private(path)?;
             let buf = std::fs::read(path)?;
             if buf.len() == 32 {
                 let mut sk = [0u8; 32];
@@ -309,7 +316,9 @@ impl OnionMaterial {
         };
         let bytes = bincode::serialize(&file)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-        std::fs::write(path, bytes)
+        let tmp = path.with_extension("key.new");
+        crate::seal::write_private_new(&tmp, &bytes)?;
+        std::fs::rename(&tmp, path)
     }
 
     /// `true` — публичный ключ сменился, надо разослать дескриптор.
@@ -366,18 +375,10 @@ pub fn open(
 
 /// Повтор v1-ячейки: тот же `eph`, час, не больше 8192, только RAM.
 /// v2 сюда не пишется. У него `void_onion::OnionReplay` (BLAKE2b-128, 14 суток).
+#[derive(Default)]
 pub struct EphReplay {
     seen: HashMap<[u8; 32], Instant>,
     order: VecDeque<[u8; 32]>,
-}
-
-impl Default for EphReplay {
-    fn default() -> Self {
-        Self {
-            seen: HashMap::new(),
-            order: VecDeque::new(),
-        }
-    }
 }
 
 impl EphReplay {
@@ -388,7 +389,10 @@ impl EphReplay {
     pub fn note(&mut self, eph: &[u8; 32]) -> bool {
         let now = Instant::now();
         while let Some(old) = self.order.front() {
-            let stale = self.seen.get(old).is_some_and(|at| now.duration_since(*at) > Self::TTL);
+            let stale = self
+                .seen
+                .get(old)
+                .is_some_and(|at| now.duration_since(*at) > Self::TTL);
             if !stale && self.order.len() < Self::MAX {
                 break;
             }
@@ -432,12 +436,13 @@ fn map_peel(peeled: void_onion::V2Peel) -> Result<V2Peel> {
     }
 }
 
-
 pub fn peel_material(mat: &OnionMaterial, cell: &[u8]) -> Result<V2Peel> {
     match void_onion::peel_v2(&mat.current, cell) {
         Ok(p) => map_peel(p),
         Err(e) => match &mat.prev {
-            Some(prev) => void_onion::peel_v2(prev, cell).or(Err(e)).and_then(map_peel),
+            Some(prev) => void_onion::peel_v2(prev, cell)
+                .or(Err(e))
+                .and_then(map_peel),
             None => Err(e),
         },
     }
@@ -472,7 +477,11 @@ pub fn b64_encode(data: &[u8]) -> String {
     }
     if i < data.len() {
         let b0 = data[i] as u32;
-        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
         let n = (b0 << 16) | (b1 << 8);
         out.push(T[((n >> 18) & 63) as usize] as char);
         out.push(T[((n >> 12) & 63) as usize] as char);
@@ -499,7 +508,7 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     let bytes = s.as_bytes();
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
@@ -508,8 +517,16 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
         let pad = (bytes[i + 2] == b'=') as usize + (bytes[i + 3] == b'=') as usize;
         let a = val(bytes[i])?;
         let b = val(bytes[i + 1])?;
-        let c = if bytes[i + 2] == b'=' { 0 } else { val(bytes[i + 2])? };
-        let d = if bytes[i + 3] == b'=' { 0 } else { val(bytes[i + 3])? };
+        let c = if bytes[i + 2] == b'=' {
+            0
+        } else {
+            val(bytes[i + 2])?
+        };
+        let d = if bytes[i + 3] == b'=' {
+            0
+        } else {
+            val(bytes[i + 3])?
+        };
         let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
         out.push((n >> 16) as u8);
         if pad < 2 {
@@ -524,15 +541,37 @@ pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
 }
 
 pub fn parse_epoch_from_agent(agent: &str) -> Option<u64> {
-    agent.split(";epoch=").nth(1)?.split(';').next()?.trim().parse().ok()
+    agent
+        .split(";epoch=")
+        .nth(1)?
+        .split(';')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 pub fn parse_until_from_agent(agent: &str) -> Option<u64> {
-    agent.split(";until=").nth(1)?.split(';').next()?.trim().parse().ok()
+    agent
+        .split(";until=")
+        .nth(1)?
+        .split(';')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 pub fn parse_op_from_agent(agent: &str) -> Option<String> {
-    Some(agent.split(";op=").nth(1)?.split(';').next()?.trim().to_string())
+    Some(
+        agent
+            .split(";op=")
+            .nth(1)?
+            .split(';')
+            .next()?
+            .trim()
+            .to_string(),
+    )
 }
 
 pub fn parse_osig2_from_agent(agent: &str) -> Option<Vec<u8>> {

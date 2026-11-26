@@ -8,15 +8,17 @@
 //! a live grant does not send that copy. A store that still arrives (no grant,
 //! or a peer without the bit) is kept here, without the uploader PeerId.
 
-use std::collections::{HashMap, HashSet};
 use rand::RngCore;
+use std::collections::HashMap;
 use std::error::Error;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use void_envelope::offline_mail::OfflineEnvelope;
-use void_envelope::queue_mail::{self, QueueDir, QUEUE_BUCKET, QUEUE_TTL_SECS};
+#[cfg(test)]
+use void_envelope::queue_mail::{self, QUEUE_BUCKET};
+use void_envelope::queue_mail::{QueueDir, QUEUE_TTL_SECS};
 use void_frames::protocol::ChallengeBook;
 
 const FILE: &str = "relay_mailbox.bin";
@@ -106,17 +108,6 @@ struct RelayFileV5 {
     leases: HashMap<String, Vec<LeasedBatch>>,
 }
 
-/// Same field order as `void_envelope::queue_mail::StoredQueue`; `QueueDir`
-/// keeps that type private, while the relay needs its IDs for fallback delivery.
-#[derive(Deserialize)]
-struct QueueIndexDisk {
-    queue_id: [u8; 32],
-    _owner_pk: Vec<u8>,
-    _write_token: [u8; 32],
-    _expiry: u64,
-    _blobs: Vec<Vec<u8>>,
-}
-
 #[derive(Default, Serialize, Deserialize)]
 struct RelayDataV2 {
     #[serde(default)]
@@ -143,6 +134,8 @@ pub(crate) enum StoreResult {
     Rejected,
 }
 
+type LegacyLease = ([u8; 16], u64, [u8; 32], Vec<OfflineEnvelope>);
+
 pub(crate) struct RelayMailbox {
     seal_key: Option<[u8; 32]>,
     dir: QueueDir,
@@ -150,8 +143,6 @@ pub(crate) struct RelayMailbox {
     pending: HashMap<String, QueueSlot>,
     legacy: HashMap<String, Vec<StoredEnvelope>>,
     leases: HashMap<String, Vec<LeasedBatch>>,
-    /// Все queue_id, которые эта нода когда-либо принимала — для отдачи при подключении клиента.
-    known_queues: HashSet<[u8; 32]>,
     /// Nonces for `VOID_MAILBOX_QUERY_v1`. Process memory; a restart clears them.
     mailbox_challenges: ChallengeBook,
 }
@@ -186,7 +177,6 @@ impl RelayMailbox {
             pending: HashMap::new(),
             legacy: HashMap::new(),
             leases: HashMap::new(),
-            known_queues: HashSet::new(),
             mailbox_challenges: ChallengeBook::new(),
         }
     }
@@ -194,19 +184,12 @@ impl RelayMailbox {
     fn ingest(&mut self, plain: &[u8], now: u64) {
         if let Some(body) = plain.strip_prefix(FORMAT_V5.as_slice()) {
             let file = bincode::deserialize::<RelayFileV5>(body).unwrap_or_default();
-            self.known_queues = bincode::deserialize::<Vec<QueueIndexDisk>>(&file.dir)
-                .unwrap_or_default().into_iter().map(|queue| queue.queue_id).collect();
             self.dir = QueueDir::import(&file.dir);
             self.pending = slots_from_disk(file.pending);
             self.legacy = file.legacy;
             self.leases = file.leases;
         } else if let Some(body) = plain.strip_prefix(FORMAT_V4.as_slice()) {
             let file = bincode::deserialize::<RelayFileV4>(body).unwrap_or_default();
-            self.known_queues = bincode::deserialize::<Vec<QueueIndexDisk>>(&file.dir)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|queue| queue.queue_id)
-                .collect();
             self.dir = QueueDir::import(&file.dir);
             self.pending = slots_from_disk(file.pending);
             self.legacy = file.legacy;
@@ -292,7 +275,10 @@ impl RelayMailbox {
     }
 
     pub(crate) fn is_empty(&self) -> bool {
-        self.dir.is_empty() && self.pending.is_empty() && self.legacy.is_empty() && self.leases.is_empty()
+        self.dir.is_empty()
+            && self.pending.is_empty()
+            && self.legacy.is_empty()
+            && self.leases.is_empty()
     }
 
     /// Drop expired queues and VRM2 letters. `true` if anything was removed.
@@ -317,7 +303,10 @@ impl RelayMailbox {
                     let batch = batches.remove(index);
                     let slot = self.legacy.entry(slot_key.clone()).or_default();
                     for item in batch.envelopes.into_iter().rev() {
-                        if !slot.iter().any(|have| have.env.message_id == item.env.message_id) {
+                        if !slot
+                            .iter()
+                            .any(|have| have.env.message_id == item.env.message_id)
+                        {
                             slot.insert(0, item);
                         }
                     }
@@ -351,8 +340,13 @@ impl RelayMailbox {
             return;
         }
         let blobs = slot.letters.into_iter().map(|letter| letter.blob).collect();
-        self.dir
-            .adopt(*queue_id, slot.owner_pk, slot.write_token, slot.expiry, blobs);
+        self.dir.adopt(
+            *queue_id,
+            slot.owner_pk,
+            slot.write_token,
+            slot.expiry,
+            blobs,
+        );
     }
 
     pub(crate) fn create(
@@ -365,7 +359,6 @@ impl RelayMailbox {
         now: u64,
     ) -> bool {
         self.adopt(&queue_id, now);
-        self.known_queues.insert(queue_id);
         self.dir
             .create(queue_id, owner_pk, write_token, expiry, sig, now)
     }
@@ -380,7 +373,6 @@ impl RelayMailbox {
         now: u64,
     ) -> StoreResult {
         self.adopt(queue_id, now);
-        self.known_queues.insert(*queue_id);
         match self.dir.store(*queue_id, proof, blob, now) {
             Some(stored) if stored.fresh => StoreResult::Stored {
                 bucket: stored.bucket,
@@ -428,33 +420,6 @@ impl RelayMailbox {
         self.dir.take_batch(*queue_id, max_plain_bytes, now)
     }
 
-    /// Отдаёт блобы из всех известных очередей (включая аудио-очереди) и очищает их.
-    /// Используется при подключении клиента, который не шлёт `QueueQuery`.
-    pub(crate) fn take_all_queues(
-        &mut self,
-        max_plain_bytes: usize,
-        now: u64,
-    ) -> Vec<Vec<u8>> {
-        let mut out: Vec<Vec<u8>> = Vec::new();
-        let mut used = 0usize;
-        let ids: Vec<[u8; 32]> = self.known_queues.iter().copied().collect();
-        for queue_id in ids {
-            if used >= max_plain_bytes {
-                break;
-            }
-            let blobs = self.take_batch(&queue_id, max_plain_bytes.saturating_sub(used), now);
-            for blob in blobs {
-                let n = blob.len();
-                if !out.is_empty() && used.saturating_add(n) > max_plain_bytes {
-                    break;
-                }
-                out.push(blob);
-                used = used.saturating_add(n);
-            }
-        }
-        out
-    }
-
     /// PeerId copy from a client that has no queue grant. The uploader is not stored.
     pub(crate) fn accept_legacy(
         &mut self,
@@ -472,7 +437,10 @@ impl RelayMailbox {
         let empty = {
             let slot = self.legacy.entry(id.clone()).or_default();
             for env in envelopes {
-                if slot.iter().any(|have| have.env.message_id == env.message_id) {
+                if slot
+                    .iter()
+                    .any(|have| have.env.message_id == env.message_id)
+                {
                     continue;
                 }
                 slot.push(StoredEnvelope {
@@ -553,10 +521,7 @@ impl RelayMailbox {
         let Ok(id) = recipient.parse::<libp2p::PeerId>() else {
             return Vec::new();
         };
-        if !self
-            .mailbox_challenges
-            .authorize(&id, ts, nonce, sig, now)
-        {
+        if !self.mailbox_challenges.authorize(&id, ts, nonce, sig, now) {
             return Vec::new();
         }
         self.take_legacy(recipient, max_plain_bytes, now)
@@ -570,9 +535,12 @@ impl RelayMailbox {
         sig: &[u8],
         max_plain_bytes: usize,
         now: u64,
-    ) -> Option<([u8; 16], u64, [u8; 32], Vec<OfflineEnvelope>)> {
+    ) -> Option<LegacyLease> {
         let id: libp2p::PeerId = recipient.parse().ok()?;
-        if !self.mailbox_challenges.authorize(&id, ts, query_nonce, sig, now) {
+        if !self
+            .mailbox_challenges
+            .authorize(&id, ts, query_nonce, sig, now)
+        {
             return None;
         }
         self.purge_expired(now);
@@ -604,23 +572,35 @@ impl RelayMailbox {
         let expires_at = now.saturating_add(MAILBOX_LEASE_SECS);
         let envelopes = leased.iter().map(|item| item.env.clone()).collect();
         self.leases.entry(slot_key).or_default().push(LeasedBatch {
-            lease_id, expires_at, ack_nonce, envelopes: leased,
+            lease_id,
+            expires_at,
+            ack_nonce,
+            envelopes: leased,
         });
         Some((lease_id, expires_at, ack_nonce, envelopes))
     }
 
     pub(crate) fn cancel_lease(&mut self, recipient: &str, lease_id: &[u8; 16], now: u64) -> bool {
         let slot_key = self.legacy_slot(recipient);
-        let Some(batches) = self.leases.get_mut(&slot_key) else { return false; };
-        let Some(index) = batches.iter().position(|batch| batch.lease_id == *lease_id) else { return false; };
+        let Some(batches) = self.leases.get_mut(&slot_key) else {
+            return false;
+        };
+        let Some(index) = batches.iter().position(|batch| batch.lease_id == *lease_id) else {
+            return false;
+        };
         let batch = batches.remove(index);
         let slot = self.legacy.entry(slot_key.clone()).or_default();
         for item in batch.envelopes.into_iter().rev() {
-            if !slot.iter().any(|have| have.env.message_id == item.env.message_id) {
+            if !slot
+                .iter()
+                .any(|have| have.env.message_id == item.env.message_id)
+            {
                 slot.insert(0, item);
             }
         }
-        if batches.is_empty() { self.leases.remove(&slot_key); }
+        if batches.is_empty() {
+            self.leases.remove(&slot_key);
+        }
         let _ = now;
         true
     }
@@ -634,10 +614,16 @@ impl RelayMailbox {
         sig: &[u8],
         now: u64,
     ) -> bool {
-        let Ok(peer) = recipient.parse::<libp2p::PeerId>() else { return false; };
+        let Ok(peer) = recipient.parse::<libp2p::PeerId>() else {
+            return false;
+        };
         let slot_key = self.legacy_slot(recipient);
-        let Some(batches) = self.leases.get_mut(&slot_key) else { return false; };
-        let Some(index) = batches.iter().position(|batch| batch.lease_id == *lease_id) else { return false; };
+        let Some(batches) = self.leases.get_mut(&slot_key) else {
+            return false;
+        };
+        let Some(index) = batches.iter().position(|batch| batch.lease_id == *lease_id) else {
+            return false;
+        };
         let batch = &batches[index];
         if batch.expires_at <= now || batch.ack_nonce != *ack_nonce || ts.abs_diff(now) > 120 {
             return false;
@@ -646,7 +632,9 @@ impl RelayMailbox {
             return false;
         }
         batches.remove(index);
-        if batches.is_empty() { self.leases.remove(&slot_key); }
+        if batches.is_empty() {
+            self.leases.remove(&slot_key);
+        }
         true
     }
 
@@ -784,7 +772,9 @@ mod tests {
         let proof = write_proof(&token, &queue_id, &blob(1));
         assert_eq!(
             mail.store(&queue_id, &proof, blob(1), now),
-            StoreResult::Stored { bucket: QUEUE_BUCKET }
+            StoreResult::Stored {
+                bucket: QUEUE_BUCKET
+            }
         );
         let disk = QueueDisk {
             owner_pk: kp.public().encode_protobuf(),
@@ -806,8 +796,12 @@ mod tests {
         let key = [4u8; 32];
         let queue_id = [8u8; 32];
         let slot = queue_slot(Some(&key), &queue_id);
-        let peer = crate::seal::mailbox_slot(&key, "12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG");
-        assert_eq!(slot, crate::seal::mailbox_slot(&key, &void_onion::hex32(&queue_id)));
+        let peer =
+            crate::seal::mailbox_slot(&key, "12D3KooWCAH8ykDMThNRRVLAM6LnuVrJeoZrQADzHC2x6ddhZxyG");
+        assert_eq!(
+            slot,
+            crate::seal::mailbox_slot(&key, &void_onion::hex32(&queue_id))
+        );
         assert_ne!(slot, peer);
     }
 
@@ -832,7 +826,9 @@ mod tests {
         ));
         let got = mail.take_batch(&queue_id, DELIVER_BATCH_PLAIN_BYTES, now);
         assert_eq!(got, vec![body]);
-        assert!(mail.take_batch(&queue_id, DELIVER_BATCH_PLAIN_BYTES, now).is_empty());
+        assert!(mail
+            .take_batch(&queue_id, DELIVER_BATCH_PLAIN_BYTES, now)
+            .is_empty());
     }
 
     #[test]
@@ -861,28 +857,30 @@ mod tests {
         let mut mail = RelayMailbox::empty(None);
         assert!(mail.accept_legacy(&recipient, vec![env("mail-1")], now));
         let (query_nonce, query_ts) = mail.issue_mailbox_challenge(&recipient, now).unwrap();
-        let query_sig = void_frames::protocol::sign_mailbox_query(
-            &owner, &peer, query_ts, &query_nonce,
-        ).unwrap();
-        let (lease_id, _expires_at, _ack_nonce, delivered) = mail.lease_legacy_signed(
-            &recipient, query_ts, &query_nonce, &query_sig, 1 << 20, now,
-        ).unwrap();
+        let query_sig =
+            void_frames::protocol::sign_mailbox_query(&owner, &peer, query_ts, &query_nonce)
+                .unwrap();
+        let (lease_id, _expires_at, _ack_nonce, delivered) = mail
+            .lease_legacy_signed(&recipient, query_ts, &query_nonce, &query_sig, 1 << 20, now)
+            .unwrap();
         assert_eq!(delivered.len(), 1);
         assert!(mail.legacy.get(&mail.legacy_slot(&recipient)).is_none());
-        assert!(!mail.ack_legacy(
-            &recipient, &lease_id, now, &[3u8; 32], &[], now,
-        ));
+        assert!(!mail.ack_legacy(&recipient, &lease_id, now, &[3u8; 32], &[], now,));
         assert!(mail.expire_for_test(now + MAILBOX_LEASE_SECS));
-        assert_eq!(mail.take_legacy(&recipient, 1 << 20, now + MAILBOX_LEASE_SECS).len(), 1);
+        assert_eq!(
+            mail.take_legacy(&recipient, 1 << 20, now + MAILBOX_LEASE_SECS)
+                .len(),
+            1
+        );
 
         assert!(mail.accept_legacy(&recipient, vec![env("mail-2")], now));
         let (query_nonce, query_ts) = mail.issue_mailbox_challenge(&recipient, now).unwrap();
-        let query_sig = void_frames::protocol::sign_mailbox_query(
-            &owner, &peer, query_ts, &query_nonce,
-        ).unwrap();
-        let (lease_id, _, ack_nonce, _) = mail.lease_legacy_signed(
-            &recipient, query_ts, &query_nonce, &query_sig, 1 << 20, now,
-        ).unwrap();
+        let query_sig =
+            void_frames::protocol::sign_mailbox_query(&owner, &peer, query_ts, &query_nonce)
+                .unwrap();
+        let (lease_id, _, ack_nonce, _) = mail
+            .lease_legacy_signed(&recipient, query_ts, &query_nonce, &query_sig, 1 << 20, now)
+            .unwrap();
         let persisted = RelayFileV5 {
             dir: mail.dir.export(),
             pending: HashMap::new(),
@@ -893,11 +891,18 @@ mod tests {
         disk.extend(bincode::serialize(&persisted).unwrap());
         let mut restarted = RelayMailbox::empty(None);
         restarted.ingest(&disk, now);
-        assert_eq!(restarted.leases.get(&restarted.legacy_slot(&recipient)).unwrap().len(), 1);
+        assert_eq!(
+            restarted
+                .leases
+                .get(&restarted.legacy_slot(&recipient))
+                .unwrap()
+                .len(),
+            1
+        );
         let ack_ts = now + 1;
-        let ack_sig = void_frames::protocol::sign_mailbox_ack(
-            &owner, &peer, &lease_id, ack_ts, &ack_nonce,
-        ).unwrap();
+        let ack_sig =
+            void_frames::protocol::sign_mailbox_ack(&owner, &peer, &lease_id, ack_ts, &ack_nonce)
+                .unwrap();
         assert!(restarted.ack_legacy(&recipient, &lease_id, ack_ts, &ack_nonce, &ack_sig, ack_ts));
         assert!(restarted.leases.is_empty());
         assert!(restarted.legacy.is_empty());
@@ -987,7 +992,9 @@ mod tests {
         assert!(mail.legacy.is_empty());
         assert!(matches!(
             mail.store(&queue_id, &proof, blob.clone(), now),
-            StoreResult::Stored { bucket: QUEUE_BUCKET }
+            StoreResult::Stored {
+                bucket: QUEUE_BUCKET
+            }
         ));
         assert!(mail.legacy.is_empty());
         assert!(matches!(
@@ -998,10 +1005,7 @@ mod tests {
         let (nonce, ts) = mail.issue_challenge(&queue_id, now).unwrap();
         let empty_sig: &[u8] = &[];
         let owner = kp.public();
-        assert!(!owner.verify(
-            &queue_mail::query_message(&queue_id, ts, &nonce),
-            empty_sig
-        ));
+        assert!(!owner.verify(&queue_mail::query_message(&queue_id, ts, &nonce), empty_sig));
         let qsig = kp
             .sign(&queue_mail::query_message(&queue_id, ts, &nonce))
             .unwrap();
@@ -1039,10 +1043,13 @@ mod tests {
             },
         );
         let mut bytes = FORMAT_V3.to_vec();
-        bytes.extend(bincode::serialize(&RelayFileV3 {
-            queues,
-            legacy: HashMap::new(),
-        }).unwrap());
+        bytes.extend(
+            bincode::serialize(&RelayFileV3 {
+                queues,
+                legacy: HashMap::new(),
+            })
+            .unwrap(),
+        );
         let mut mail = RelayMailbox::empty(None);
         mail.ingest(&bytes, now);
         assert!(mail.legacy.is_empty());
@@ -1050,7 +1057,9 @@ mod tests {
         let proof = write_proof(&token, &queue_id, &body);
         assert_eq!(
             mail.store(&queue_id, &proof, body, now),
-            StoreResult::Duplicate { bucket: QUEUE_BUCKET }
+            StoreResult::Duplicate {
+                bucket: QUEUE_BUCKET
+            }
         );
         assert!(mail.pending.is_empty());
         assert!(mail.dir.contains(&queue_id));
@@ -1110,10 +1119,3 @@ mod tests {
             .is_empty());
     }
 }
-
-
-
-
-
-
-

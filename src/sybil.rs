@@ -61,7 +61,9 @@ impl SybilGate {
         if slashes.is_empty() {
             return (true, true);
         }
-        let over = slashes.iter().any(|net| self.count(*net) > SLASH16_TCP_LIMIT);
+        let over = slashes
+            .iter()
+            .any(|net| self.count(*net) > SLASH16_TCP_LIMIT);
         if !over {
             (true, true)
         } else {

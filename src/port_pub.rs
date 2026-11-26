@@ -162,7 +162,10 @@ fn discover_from_cloudpub_config(local_libp2p: u16, local_seed: u16) -> Option<(
         if host.is_empty() && libp2p_pub == 0 && seed_pub == 0 {
             continue;
         }
-        info!("CloudPub config {:?}: host={} libp2p={} seed={}", path, host, libp2p_pub, seed_pub);
+        info!(
+            "CloudPub config {:?}: host={} libp2p={} seed={}",
+            path, host, libp2p_pub, seed_pub
+        );
         return Some((host, libp2p_pub, seed_pub));
     }
     None
@@ -210,7 +213,10 @@ async fn cloudpub_cli_ls(local_libp2p: u16, local_seed: u16) -> Option<(String, 
     if host.is_empty() && libp2p_pub == 0 && seed_pub == 0 {
         return None;
     }
-    info!("CloudPub clo ls: host={} libp2p={} seed={}", host, libp2p_pub, seed_pub);
+    info!(
+        "CloudPub clo ls: host={} libp2p={} seed={}",
+        host, libp2p_pub, seed_pub
+    );
     Some((host, libp2p_pub, seed_pub))
 }
 
@@ -323,6 +329,14 @@ fn upnp_scan(local_libp2p: u16, local_seed: u16) -> Option<UpnpScan> {
 }
 
 pub async fn discover(local_libp2p: u16, local_seed: u16) -> Reachability {
+    if std::env::var("VOID_PUBLIC_NODE").as_deref() != Ok("1") {
+        return Reachability {
+            host: String::new(),
+            libp2p_port: local_libp2p,
+            seed_port: local_seed,
+            source: "local".into(),
+        };
+    }
     let mut host = std::env::var("PUBLIC_HOST").unwrap_or_default();
     let mut libp2p_pub = local_libp2p;
     let mut seed_pub = local_seed;
@@ -360,10 +374,8 @@ pub async fn discover(local_libp2p: u16, local_seed: u16) -> Reachability {
         );
     }
 
-    if env_flag("CLOUDPUB_AUTO_PUBLISH") {
-        if cloudpub_cli_register(local_libp2p, local_seed).await {
-            tokio::time::sleep(Duration::from_secs(1)).await;
-        }
+    if env_flag("CLOUDPUB_AUTO_PUBLISH") && cloudpub_cli_register(local_libp2p, local_seed).await {
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     if let Some((h, lp, sp)) = cloudpub_cli_ls(local_libp2p, local_seed).await {
