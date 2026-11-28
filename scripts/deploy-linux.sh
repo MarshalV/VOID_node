@@ -119,4 +119,4 @@ case "${1:-install}" in
     log "service removed; data preserved at $DATA_DIR"
     ;;
   *) echo "usage: sudo bash scripts/deploy-linux.sh [install|start|restart|status|logs|uninstall]" >&2; exit 2 ;;
-esac`n
+esac
