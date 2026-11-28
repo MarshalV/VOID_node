@@ -288,3 +288,30 @@ rate-limited per peer and globally; exhaustion returns an empty response.
 Bootstrap HTTP discovery requires HTTPS, an exact `VOID_BOOTSTRAP_TRUSTED_HOSTS`
 allowlist, and a detached Ed25519 signature (`VOID_BOOTSTRAP_SIGNING_PUB_HEX`
 and `VOID_BOOTSTRAP_URL_SIG_HEX`). Redirects are disabled.
+# Linux deployment
+
+The supported deployment entry point is:
+
+```bash
+sudo bash scripts/deploy-linux.sh install
+```
+
+The script builds the release binary, creates the restricted `voidnode` service
+account, installs the binary under `/opt/void-bootstrap-node`, keeps identity
+and mailbox state under `/opt/void-bootstrap-node/data`, applies private file
+permissions, generates a hardened systemd unit, enables the public listener,
+configures UFW when it is active, and starts the node.
+
+Commands:
+
+```bash
+sudo bash scripts/deploy-linux.sh restart
+sudo bash scripts/deploy-linux.sh status
+sudo bash scripts/deploy-linux.sh logs
+sudo bash scripts/deploy-linux.sh uninstall
+```
+
+Configuration can be supplied as environment variables: `VOID_NODE_USER`,
+`VOID_NODE_DIR`, `VOID_NODE_DATA`, `LISTEN_IP`, `LISTEN_PORT`, `SEED_PORT`,
+`SEED_BIND`, and `RUST_LOG`. The script never removes identity, mailbox,
+prekey, onion, or known-node state. `uninstall` removes only the service unit.
